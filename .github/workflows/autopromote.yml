@@ -1,0 +1,25 @@
+name: Autopromote branches
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update-release:
+    if: github.ref == 'refs/heads/main'
+    name: Merge main into release after a PR is merged
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Merge
+        uses: mtanzi/action-automerge@v1
+        id: merge
+        with:
+          # PAT is required to run workflows on the merged branch
+          # See https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs
+          github_token: ${{ secrets.PRIVATE_TOKEN }}
+          source: "main"
+          target: "release"
