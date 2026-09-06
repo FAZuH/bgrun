@@ -5,10 +5,17 @@
 //! run this binary against PATH shims for systemctl/systemd-run/journalctl.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::process::{Command, ExitCode};
+use std::io::Write;
+use std::io::{self};
+use std::process::Command;
+use std::process::ExitCode;
 
-use bgrun::{Action, ExitCodes, JobName, ParseError, Prefix, RunSpec};
+use bgrun::Action;
+use bgrun::ExitCodes;
+use bgrun::JobName;
+use bgrun::ParseError;
+use bgrun::Prefix;
+use bgrun::RunSpec;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();

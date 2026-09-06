@@ -4,10 +4,13 @@
 //! turns parsed [`Action`]s into subprocess calls; end-to-end tests cover
 //! that layer against PATH shims. Everything here is unit-tested inline.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
-use std::process::{ExitCode, ExitStatus, Output};
+use std::process::ExitCode;
+use std::process::ExitStatus;
+use std::process::Output;
 
 /// Exit code for usage errors (bad arguments, unknown command).
 pub const EXIT_USAGE: u8 = 2;

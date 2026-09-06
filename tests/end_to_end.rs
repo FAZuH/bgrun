@@ -5,8 +5,10 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::process::Command;
+use std::process::Output;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
