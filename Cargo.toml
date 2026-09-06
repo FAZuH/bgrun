@@ -1,0 +1,22 @@
+[package]
+name = "bgrun"
+# Version is patched by CI on the release branch; do not bump by hand.
+version = "0.1.0"
+edition = "2024"
+authors = ["FAZuH <mail@fazuh.com>"]
+description = "Minimal background job runner for Linux — run commands as transient systemd user units"
+license = "MIT"
+repository = "https://github.com/FAZuH/bgrun"
+keywords = ["cli", "systemd", "background", "jobs", "linux"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+uninlined_format_args = "warn"
