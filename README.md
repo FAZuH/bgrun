@@ -9,7 +9,7 @@
 <hr>
 
 <div align="center">
-● <a href="#installation">Installation</a> ﻿ ● <a href="#usage">Usage</a> ﻿ ● <a href="#notes">Notes</a> ﻿ ● <a href="#docs">Docs</a> ﻿ ● <a href="#license">License</a>
+● <a href="#installation">Installation</a> ﻿ ● <a href="#usage">Usage</a> ﻿ ● <a href="#notes">Notes</a> ﻿ ● <a href="#agent-skill">Agent skill</a> ﻿ ● <a href="#docs">Docs</a> ﻿ ● <a href="#license">License</a>
 </div>
 
 ## Installation
@@ -66,6 +66,15 @@ Run `bgrun help` for the full command list.
   which is exactly why `bgrun remove` is what deletes that file again.
 - The unit prefix is `bgrun`, override with `BGRUN_PREFIX` (letters, digits,
   `-` and `_` only).
+
+## Agent skill
+
+[bgrun ships an agent skill](skills/bgrun/SKILL.md) so a coding assistant
+reaches for `bgrun` instead of a bare `&`:
+
+```sh
+npx skills add FAZuH/bgrun
+```
 
 ## Docs
 
