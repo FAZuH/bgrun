@@ -200,6 +200,9 @@ pub enum ParseError {
     UnsupportedOverride {
         value: String,
     },
+    /// A `systemd-run -p` / `--property` with no `KEY=VALUE` behind it, which
+    /// would take the command's first word as its value.
+    MissingPropertyValue,
     /// Neither `XDG_CONFIG_HOME` nor `HOME` is set, so the systemd user
     /// unit directory cannot be located.
     NoUnitDirectory,
@@ -228,6 +231,10 @@ impl fmt::Display for ParseError {
             Self::UnsupportedOverride { value } => write!(
                 f,
                 "cannot persist {value:?}: only -p KEY=VALUE overrides can be written to a unit file"
+            ),
+            Self::MissingPropertyValue => write!(
+                f,
+                "-p needs a KEY=VALUE (it is systemd-run's --property); bgrun's own flags are -r/--restart and -b/--persist"
             ),
             Self::NoUnitDirectory => write!(
                 f,
@@ -304,9 +311,24 @@ fn launch(name: Option<JobName>, args: &[OsString]) -> Result<Action, ParseError
     let Some(offset) = rest.iter().position(|arg| arg.as_os_str() == "--") else {
         return Err(ParseError::MissingSeparator);
     };
-    let mut spec = run_spec(name, &rest[..offset], &rest[offset + 1..])?;
+    let (region, tail) = rest.split_at(offset);
+    if dangling_property(region) {
+        return Err(ParseError::MissingPropertyValue);
+    }
+    let mut spec = run_spec(name, region, &tail[1..])?;
     flags.apply(&mut spec);
     Ok(Action::Run(spec))
+}
+
+/// A `-p` / `--property` with no `KEY=VALUE` behind it. Forwarded verbatim,
+/// `systemd-run` would take the command's first word as the value and then
+/// fail with "Failed to find executable <word>", which blames the command
+/// instead of the option the user got wrong.
+fn dangling_property(region: &[OsString]) -> bool {
+    matches!(
+        region.last().map(OsString::as_os_str),
+        Some(flag) if flag == OsStr::new("-p") || flag == OsStr::new("--property")
+    )
 }
 
 /// bgrun's own flags, which both launch forms accept in front of the `--`.
@@ -783,8 +805,49 @@ mod tests {
     }
 
     #[test]
+    fn a_dangling_property_never_reaches_systemd_run() {
+        // `-p` there is systemd-run's --property with no value: it would take
+        // "opencode2" as the value and then try to run "serve".
+        assert_eq!(
+            parse(&os(&["-p", "--", "opencode2", "serve", "--port", "4096"])),
+            Err(ParseError::MissingPropertyValue)
+        );
+        assert_eq!(
+            parse(&os(&["add", "api", "-p", "--", "make"])),
+            Err(ParseError::MissingPropertyValue)
+        );
+        assert_eq!(
+            parse(&os(&["add", "api", "--property", "--", "make"])),
+            Err(ParseError::MissingPropertyValue)
+        );
+    }
+
+    #[test]
+    fn a_property_with_a_value_is_untouched() {
+        assert_eq!(
+            spec(&["-p", "MemoryMax=1G", "--", "make"]).systemd_opts,
+            os(&["-p", "MemoryMax=1G"])
+        );
+        assert_eq!(
+            spec(&["-pMemoryMax=1G", "--", "make"]).systemd_opts,
+            os(&["-pMemoryMax=1G"])
+        );
+        // The command's own `-p` is past the separator, so it is not ours.
+        assert_eq!(
+            spec(&["-p", "MemoryMax=1G", "--", "make", "-p", "8080"]).command,
+            os(&["make", "-p", "8080"])
+        );
+    }
+
+    #[test]
     fn unit_file_refuses_a_property_without_a_value() {
-        let spec = spec(&["add", "--persist", "-p", "--", "make"]);
+        // Built directly: the parser rejects this shape before it gets here.
+        let spec = RunSpec {
+            name: Some(s("build")),
+            systemd_opts: os(&["-p"]),
+            command: os(&["make"]),
+            persist: true,
+        };
         assert_eq!(
             unit_file(&s("build"), &spec),
             Err(ParseError::UnsupportedOverride { value: "-p".into() })
