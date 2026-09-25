@@ -1,3 +1,11 @@
+## [0.1.3](https://github.com/FAZuH/bgrun/compare/v0.1.2...v0.1.3) (2026-09-25)
+
+
+### Features
+
+* **cli:** a stop that can be undone, with resume ([149f6ff](https://github.com/FAZuH/bgrun/commit/149f6ffa46a006af07f252277bda8af9c33cf539))
+* **cli:** short forms for --restart and --persist ([2fa86dd](https://github.com/FAZuH/bgrun/commit/2fa86ddcd429f30a628eb27ad790afcfddb6a374))
+
 ## [0.1.2](https://github.com/FAZuH/bgrun/compare/v0.1.1...v0.1.2) (2026-09-25)
 
 
