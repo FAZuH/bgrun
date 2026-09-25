@@ -5,10 +5,19 @@
 //! run this binary against PATH shims for systemctl/systemd-run/journalctl.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::process::{Command, ExitCode};
+use std::fs;
+use std::io::Write;
+use std::io::{self};
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::ExitCode;
 
-use bgrun::{Action, ExitCodes, JobName, ParseError, Prefix, RunSpec};
+use bgrun::Action;
+use bgrun::ExitCodes;
+use bgrun::JobName;
+use bgrun::ParseError;
+use bgrun::Prefix;
+use bgrun::RunSpec;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -52,7 +61,11 @@ fn run(prefix: &Prefix, spec: RunSpec) -> ExitCode {
 
     let name = spec
         .name
+        .clone()
         .unwrap_or_else(|| JobName::from_command(&spec.command));
+    if spec.persist {
+        return persist(prefix, &name, &spec);
+    }
     let unit = prefix.unit(&name);
 
     // No existence pre-check: systemd-run itself rejects a duplicate unit
@@ -85,24 +98,51 @@ fn run(prefix: &Prefix, spec: RunSpec) -> ExitCode {
     }
 }
 
+/// Back the job with a real unit file so it starts on every boot. Nothing
+/// transient can do this — see [`bgrun::unit_file`].
+fn persist(prefix: &Prefix, name: &JobName, spec: &RunSpec) -> ExitCode {
+    let Some(dir) = user_unit_dir() else {
+        return fail(ParseError::NoUnitDirectory);
+    };
+    let unit = prefix.unit(name);
+    let path = dir.join(&unit);
+    let body = match bgrun::unit_file(name, spec) {
+        Ok(body) => body,
+        Err(error) => return fail(error),
+    };
+    if let Err(error) = fs::create_dir_all(&dir).and_then(|()| fs::write(&path, body)) {
+        eprintln!("error: cannot write {}: {error}", path.display());
+        return ExitCodes::failure();
+    }
+
+    let (reloaded, ok) = systemctl_user(&["daemon-reload"]);
+    if !ok {
+        let _ = fs::remove_file(&path);
+        return reloaded;
+    }
+    // `--now` starts the job immediately, so persisting behaves like a
+    // plain launch plus a boot hook.
+    let (enabled, ok) = systemctl_user(&["enable", "--now", &unit]);
+    if !ok {
+        // A unit file systemd refuses would otherwise be retried at every
+        // boot, forever, with nobody around to read the failure.
+        forget(prefix, name);
+        return enabled;
+    }
+    println!("persisted: {unit} (starts on every boot)");
+    enabled
+}
+
 fn list(prefix: &Prefix) -> ExitCode {
-    forward(
-        Command::new("systemctl")
-            .arg("--user")
-            .arg("list-units")
-            .arg(prefix.glob())
-            .arg("--all")
-            .arg("--no-pager"),
-    )
+    let glob = prefix.glob();
+    let (code, _) = systemctl_user(&["list-units", &glob, "--all", "--no-pager"]);
+    code
 }
 
 fn status(prefix: &Prefix, name: &JobName) -> ExitCode {
-    forward(
-        Command::new("systemctl")
-            .arg("--user")
-            .arg("status")
-            .arg(prefix.unit(name)),
-    )
+    let unit = prefix.unit(name);
+    let (code, _) = systemctl_user(&["status", &unit]);
+    code
 }
 
 fn logs(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCode {
@@ -127,6 +167,7 @@ fn remove(prefix: &Prefix, names: &[JobName]) -> ExitCode {
                 .arg(&unit)
                 .output();
         }
+        forget(prefix, name);
         println!("removed: {unit}");
     }
     ExitCode::SUCCESS
@@ -135,10 +176,11 @@ fn remove(prefix: &Prefix, names: &[JobName]) -> ExitCode {
 fn clean(prefix: &Prefix) -> ExitCode {
     // Units run with --collect, so successful jobs are already gone; this
     // only clears units that exited non-zero.
+    let glob = prefix.glob();
     match Command::new("systemctl")
         .arg("--user")
         .arg("reset-failed")
-        .arg(prefix.glob())
+        .arg(&glob)
         .output()
     {
         Ok(output) if output.status.success() => {
@@ -154,6 +196,46 @@ fn clean(prefix: &Prefix) -> ExitCode {
 }
 
 // ---------------------------------------------------------------- misc --
+
+/// `systemctl --user <args…>` with inherited stdio: its exit code, and
+/// whether it succeeded — `ExitCode` itself cannot be compared.
+fn systemctl_user(args: &[&str]) -> (ExitCode, bool) {
+    match Command::new("systemctl").arg("--user").args(args).status() {
+        Ok(status) => (ExitCodes::of_status(&status), status.success()),
+        Err(error) => (spawn_failed("systemctl", &error), false),
+    }
+}
+
+/// Where `systemd --user` looks for unit files: `$XDG_CONFIG_HOME/systemd/user`,
+/// falling back to `$HOME/.config/systemd/user`.
+fn user_unit_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("systemd").join("user"))
+}
+
+/// Disable and delete a persisted job's unit file, so it does not come back
+/// at the next boot. A transient job has no file on disk, so this does
+/// nothing at all for it and `remove` stays as quiet as it was.
+fn forget(prefix: &Prefix, name: &JobName) {
+    let Some(dir) = user_unit_dir() else {
+        return;
+    };
+    let unit = prefix.unit(name);
+    let path = dir.join(&unit);
+    if !path.exists() {
+        return;
+    }
+    let _ = systemctl_user(&["disable", &unit]);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            let _ = systemctl_user(&["daemon-reload"]);
+        }
+        Err(error) => eprintln!("warning: cannot delete {}: {error}", path.display()),
+    }
+}
 
 /// Best-effort warning: transient user units die with the user's last
 /// session unless lingering is enabled. Never blocks starting a job.
@@ -177,11 +259,11 @@ fn warn_if_not_lingering() {
 
 fn help(prefix: &Prefix) -> String {
     format!(
-        "bgrun — run commands in the background as transient systemd user units
+        "bgrun — run commands in the background as systemd user units
 
 Usage:
   bgrun -- <command> [args...]               run in bg; name auto-derived
-  bgrun add [NAME] [overrides] -- <cmd>      run in bg, optional name
+  bgrun add [NAME] [flags] [overrides] -- <cmd>   run in bg, optional name
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
@@ -199,9 +281,18 @@ systemd-run, so you can override unit properties like WorkingDirectory:
   bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
   bgrun add backup -- rsync -a ~/src/ /mnt/backup/
 
+Flags for 'add' (go after [NAME], before any override):
+  --restart    restart the command when it exits non-zero
+               (systemd's own limit still applies: 5 starts per 10s)
+  --persist    write a unit file and enable it, so the job also runs at
+               every boot. Only -p KEY=VALUE overrides can be persisted.
+
 Notes:
   - Units are transient (--collect): finished jobs disappear on their own;
     'clean' only clears units that exited non-zero.
+  - '--persist' is the exception: it writes a real unit file under the
+    systemd user unit directory, and 'bgrun remove' is what deletes it.
+    Without that the job returns at every boot.
   - Jobs survive logout only if lingering is enabled:
       loginctl enable-linger $USER
     'bgrun add' warns when it is off.
