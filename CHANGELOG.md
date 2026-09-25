@@ -1,3 +1,15 @@
+## [0.1.4](https://github.com/FAZuH/bgrun/compare/v0.1.3...v0.1.4) (2026-09-25)
+
+
+### Features
+
+* **cli:** add -V/--version ([b75a79c](https://github.com/FAZuH/bgrun/commit/b75a79ca54a117f583664143bbdb2c1bd562e547))
+
+
+### Bug Fixes
+
+* **cli:** reject a -p with no property value ([b640b23](https://github.com/FAZuH/bgrun/commit/b640b235b271342161fac7c7b16334e6ead87625))
+
 ## [0.1.3](https://github.com/FAZuH/bgrun/compare/v0.1.2...v0.1.3) (2026-09-25)
 
 
