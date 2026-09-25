@@ -1,3 +1,10 @@
+## [0.1.5](https://github.com/FAZuH/bgrun/compare/v0.1.4...v0.1.5) (2026-09-25)
+
+
+### Bug Fixes
+
+* **cli:** resolve a persisted command to an absolute path ([3e23f02](https://github.com/FAZuH/bgrun/commit/3e23f02e4cb72113b3de00dbf05268fbfc155881))
+
 ## [0.1.4](https://github.com/FAZuH/bgrun/compare/v0.1.3...v0.1.4) (2026-09-25)
 
 
@@ -32,16 +39,4 @@
 
 * **cli:** add --restart and --persist to bgrun add ([0c59d24](https://github.com/FAZuH/bgrun/commit/0c59d24a0c4f38c51970c822c465082bc3c6abfc))
 * **skill:** add bgrun agent skill for npx skills install ([4a2cedd](https://github.com/FAZuH/bgrun/commit/4a2cedd0a13c454d6bccce5dc6080010284bfb6e))
-
-## [0.1.0](https://github.com/FAZuH/bgrun/compare/fd732beb11e29b50a7629af2541b98585bbfd37d...v0.1.0) (2026-09-06)
-
-
-### Features
-
-* port bgrun to a standalone rust cli ([fd732be](https://github.com/FAZuH/bgrun/commit/fd732beb11e29b50a7629af2541b98585bbfd37d))
-
-
-### Bug Fixes
-
-* restore require-patched-cargo input in build workflow ([5c18dab](https://github.com/FAZuH/bgrun/commit/5c18dab60c84c4e7dce948be9957f2fc3b821bc9))
 

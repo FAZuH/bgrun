@@ -1,7 +1,7 @@
 [package]
 name = "bgrun"
 # Version is patched by CI on the release branch; do not bump by hand.
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["FAZuH <mail@fazuh.com>"]
 description = "Minimal background job runner for Linux — run commands as systemd user units"
