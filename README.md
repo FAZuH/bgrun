@@ -2,7 +2,7 @@
 
 # bgrun
 
-**Minimal background job runner for Linux — run any command as a transient systemd user unit.**
+**Minimal background job runner for Linux — run any command as a systemd user unit.**
 
 </div>
 
@@ -41,6 +41,13 @@ bgrun add build -p WorkingDirectory=$HOME/project -- make
 bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 ```
 
+`bgrun add` takes two flags of its own, between the name and the overrides:
+
+```sh
+bgrun add api --restart -- ./server            # retry whenever it exits non-zero
+bgrun add sync --persist -- ./sync.sh ~/data   # also runs at every boot
+```
+
 Run `bgrun help` for the full command list.
 
 ## Notes
@@ -50,6 +57,13 @@ Run `bgrun help` for the full command list.
   `loginctl enable-linger $USER`. `bgrun add` warns when it is off.
 - Successful jobs disappear on their own (transient `--collect` units);
   `bgrun clean` only clears units that exited non-zero.
+- `--restart` is `Restart=on-failure`, so systemd's own start limit still
+  applies: 5 starts per 10s, after which the job gives up and is collected.
+- `--persist` is the one thing that is not transient — a transient unit
+  cannot be enabled, so bgrun writes a unit file under the systemd user unit
+  directory (`~/.config/systemd/user`) and enables it. Only `-p KEY=VALUE`
+  overrides can be written to a unit file. The job then starts at every boot,
+  which is exactly why `bgrun remove` is what deletes that file again.
 - The unit prefix is `bgrun`, override with `BGRUN_PREFIX` (letters, digits,
   `-` and `_` only).
 

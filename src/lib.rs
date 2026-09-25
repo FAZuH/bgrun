@@ -1,4 +1,4 @@
-//! bgrun core: argument parsing and unit naming.
+//! bgrun core: argument parsing, unit naming, and unit-file rendering.
 //!
 //! Pure logic only — no process spawning, no I/O. The binary in `main.rs`
 //! turns parsed [`Action`]s into subprocess calls; end-to-end tests cover
@@ -149,6 +149,9 @@ pub struct RunSpec {
     pub name: Option<JobName>,
     pub systemd_opts: Vec<OsString>,
     pub command: Vec<OsString>,
+    /// Back the job with a real unit file so it starts on every boot,
+    /// instead of a transient unit that only lives until it exits.
+    pub persist: bool,
 }
 
 /// Parsed command line — the closed vocabulary of everything bgrun can do.
@@ -173,12 +176,28 @@ pub enum Action {
 /// Everything that can go wrong before we shell out.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
-    UnknownCommand { command: String },
+    UnknownCommand {
+        command: String,
+    },
     MissingSeparator,
     MissingCommand,
-    MissingArgument { action: String },
-    UnexpectedArgument { action: String },
-    InvalidPrefix { value: String },
+    MissingArgument {
+        action: String,
+    },
+    UnexpectedArgument {
+        action: String,
+    },
+    InvalidPrefix {
+        value: String,
+    },
+    /// A `systemd-run` override with no unit-file spelling, given to
+    /// `add --persist`.
+    UnsupportedOverride {
+        value: String,
+    },
+    /// Neither `XDG_CONFIG_HOME` nor `HOME` is set, so the systemd user
+    /// unit directory cannot be located.
+    NoUnitDirectory,
 }
 
 impl fmt::Display for ParseError {
@@ -201,6 +220,14 @@ impl fmt::Display for ParseError {
                 f,
                 "invalid BGRUN_PREFIX {value:?}: use only ASCII letters, digits, '-' and '_'"
             ),
+            Self::UnsupportedOverride { value } => write!(
+                f,
+                "cannot persist {value:?}: only -p KEY=VALUE overrides can be written to a unit file"
+            ),
+            Self::NoUnitDirectory => write!(
+                f,
+                "cannot locate the systemd user unit directory: XDG_CONFIG_HOME and HOME are both unset"
+            ),
         }
     }
 }
@@ -215,7 +242,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
 
     match &*first {
         "help" | "-h" | "--help" => Ok(Action::Help),
-        "--" => run_spec(None, &[], rest),
+        "--" => run_spec(None, &[], rest).map(Action::Run),
         "add" => parse_add(rest),
         "list" => expect_no_args("list", rest).map(|()| Action::List),
         "clean" => expect_no_args("clean", rest).map(|()| Action::Clean),
@@ -255,7 +282,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
     }
 }
 
-/// `add [NAME] [systemd-run overrides…] -- <command…>`
+/// `add [NAME] [--restart] [--persist] [overrides] -- <command…>`
 fn parse_add(args: &[OsString]) -> Result<Action, ParseError> {
     let mut name = None;
     let mut start = 0;
@@ -270,13 +297,36 @@ fn parse_add(args: &[OsString]) -> Result<Action, ParseError> {
         start = 1;
     }
 
-    // Overrides run verbatim up to the mandatory `--`.
+    // Overrides run verbatim up to the mandatory `--`, except for bgrun's
+    // own flags, which it consumes here.
     let Some(offset) = args[start..].iter().position(|a| a.as_os_str() == "--") else {
         return Err(ParseError::MissingSeparator);
     };
     let sep = start + offset;
     let command = &args[sep + 1..];
-    run_spec(name, &args[start..sep], command)
+
+    let mut systemd_opts = Vec::new();
+    let mut persist = false;
+    let mut restart = false;
+    for arg in &args[start..sep] {
+        match arg.to_string_lossy().as_ref() {
+            "--restart" => restart = true,
+            "--persist" => persist = true,
+            _ => systemd_opts.push(arg.clone()),
+        }
+    }
+    if restart {
+        // Ahead of the user's own properties: for `systemd-run` the last
+        // assignment wins, so an explicit `-p Restart=…` still overrides.
+        systemd_opts.splice(
+            0..0,
+            [OsString::from("-p"), OsString::from("Restart=on-failure")],
+        );
+    }
+
+    let mut spec = run_spec(name, &systemd_opts, command)?;
+    spec.persist = persist;
+    Ok(Action::Run(spec))
 }
 
 /// Shared tail for the two launch forms (`-- cmd…` and `add … -- cmd…`).
@@ -284,15 +334,16 @@ fn run_spec(
     name: Option<JobName>,
     systemd_opts: &[OsString],
     command: &[OsString],
-) -> Result<Action, ParseError> {
+) -> Result<RunSpec, ParseError> {
     if command.is_empty() {
         return Err(ParseError::MissingCommand);
     }
-    Ok(Action::Run(RunSpec {
+    Ok(RunSpec {
         name,
         systemd_opts: systemd_opts.to_vec(),
         command: command.to_vec(),
-    }))
+        persist: false,
+    })
 }
 
 fn expect_no_args(action: &str, rest: &[OsString]) -> Result<(), ParseError> {
@@ -305,6 +356,99 @@ fn expect_no_args(action: &str, rest: &[OsString]) -> Result<(), ParseError> {
     }
 }
 
+// ------------------------------------------------------------ unit file --
+
+/// Render the unit file behind a persisted job.
+///
+/// A transient unit cannot be made to survive a reboot — `WantedBy=` is
+/// rejected with "Dependency type WantedBy may not be created transiently"
+/// and `systemctl enable` calls such a unit "transient or generated" — so
+/// `--persist` writes this file and lets `enable --now` do the rest.
+pub fn unit_file(name: &JobName, spec: &RunSpec) -> Result<String, ParseError> {
+    let mut lines = vec![
+        format!("# bgrun job \"{name}\" — regenerate with `bgrun add`, not by hand."),
+        "[Unit]".to_owned(),
+        format!("Description=bgrun job {name}"),
+        // What `systemd-run --collect` does for a transient unit: a job that
+        // succeeded leaves nothing behind in `bgrun list`.
+        "CollectMode=inactive-or-failed".to_owned(),
+        String::new(),
+        "[Service]".to_owned(),
+        "Type=simple".to_owned(),
+        format!("ExecStart={}", exec_start(&spec.command)),
+    ];
+    // ponytail: every property lands in [Service], so a [Unit]-only key
+    // (Requires=, After=) is dropped by systemd with a warning. Splitting
+    // them apart needs a key table nobody has asked for yet.
+    lines.extend(property_lines(&spec.systemd_opts)?);
+    lines.push(String::new());
+    lines.push("[Install]".to_owned());
+    lines.push("WantedBy=default.target".to_owned());
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
+/// `-p KEY=VALUE` and `--property=KEY=VALUE` as unit-file lines. A
+/// `systemd-run` option that is not a property (`--working-directory=…`) has
+/// no unit-file spelling, so refusing it beats silently dropping it.
+fn property_lines(opts: &[OsString]) -> Result<Vec<String>, ParseError> {
+    let mut lines = Vec::new();
+    let mut opts = opts.iter();
+    while let Some(opt) = opts.next() {
+        let text = opt.to_string_lossy();
+        let value = if text == "-p" || text == "--property" {
+            opts.next()
+                .ok_or_else(|| ParseError::UnsupportedOverride {
+                    value: text.clone().into_owned(),
+                })?
+                .to_string_lossy()
+                .into_owned()
+        } else if let Some(value) = text
+            .strip_prefix("--property=")
+            .or_else(|| text.strip_prefix("-p"))
+        {
+            value.to_owned()
+        } else {
+            return Err(ParseError::UnsupportedOverride {
+                value: text.into_owned(),
+            });
+        };
+        lines.push(value);
+    }
+    Ok(lines)
+}
+
+/// One `ExecStart=` line. Tokens are double-quoted because systemd unescapes
+/// `\\` and `\"` inside quotes, and expands `%` specifiers, so a literal
+/// percent sign has to be written `%%`.
+///
+/// ponytail: `to_string_lossy` mangles a non-UTF-8 argument and `$` is left
+/// to systemd's own unit-file parsing. Both only differ for arguments that
+/// a shell-free invocation was never going to produce.
+fn exec_start(command: &[OsString]) -> String {
+    command
+        .iter()
+        .map(|arg| quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        match c {
+            '\\' | '"' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +459,18 @@ mod tests {
 
     fn s(name: &str) -> JobName {
         JobName::parse(OsStr::new(name))
+    }
+
+    fn spec(args: &[&str]) -> RunSpec {
+        let Ok(Action::Run(spec)) = parse(&os(args)) else {
+            panic!("expected Run for {args:?}");
+        };
+        spec
+    }
+
+    /// The unit file a launch would write, panicking on a rejected override.
+    fn body(name: &str, args: &[&str]) -> String {
+        unit_file(&s(name), &spec(args)).expect("unit file should render")
     }
 
     // -- JobName ------------------------------------------------------------
@@ -464,6 +620,101 @@ mod tests {
         );
     }
 
+    // -- bgrun flags --------------------------------------------------------
+
+    #[test]
+    fn restart_prepends_its_property_so_a_user_override_still_wins() {
+        let spec = spec(&["add", "--restart", "-p", "Restart=always", "--", "make"]);
+        assert_eq!(
+            spec.systemd_opts,
+            os(&["-p", "Restart=on-failure", "-p", "Restart=always"])
+        );
+        assert!(!spec.persist);
+    }
+
+    #[test]
+    fn persist_is_consumed_instead_of_forwarded() {
+        let spec = spec(&["add", "build", "--persist", "--", "make"]);
+        assert!(spec.persist);
+        assert!(spec.systemd_opts.is_empty());
+    }
+
+    #[test]
+    fn unknown_options_still_reach_systemd_run() {
+        let spec = spec(&["add", "--working-directory=/tmp", "--", "make"]);
+        assert!(!spec.persist);
+        assert_eq!(spec.systemd_opts, os(&["--working-directory=/tmp"]));
+    }
+
+    #[test]
+    fn bare_run_is_never_persisted() {
+        assert!(!spec(&["--", "sleep", "5"]).persist);
+    }
+
+    // -- unit file ----------------------------------------------------------
+
+    #[test]
+    fn unit_file_enables_the_job_at_every_boot() {
+        let body = body("build", &["add", "build", "--", "make", "-j8"]);
+        assert!(body.contains("ExecStart=\"make\" \"-j8\"\n"), "{body}");
+        assert!(body.contains("CollectMode=inactive-or-failed"), "{body}");
+        assert!(
+            body.contains("[Install]\nWantedBy=default.target\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn unit_file_puts_the_derived_property_before_the_users_own() {
+        let body = body(
+            "dl",
+            &[
+                "add",
+                "dl",
+                "--restart",
+                "-pMemoryMax=1G",
+                "--",
+                "wget",
+                "url",
+            ],
+        );
+        assert!(
+            body.contains("ExecStart=\"wget\" \"url\"\nRestart=on-failure\nMemoryMax=1G\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn unit_file_escapes_what_a_unit_file_would_otherwise_expand() {
+        // A unit file expands `%` specifiers (a transient `-p` does not), and
+        // unescapes `\\` and `\"` inside quotes.
+        let body = body("q", &["add", "--", "echo", "50%", "\"q\"", "c:\\x"]);
+        assert!(
+            body.contains(r#"ExecStart="echo" "50%%" "\"q\"" "c:\\x""#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn unit_file_refuses_overrides_it_cannot_spell() {
+        let spec = spec(&["add", "--persist", "--working-directory=/tmp", "--", "make"]);
+        assert_eq!(
+            unit_file(&s("build"), &spec),
+            Err(ParseError::UnsupportedOverride {
+                value: "--working-directory=/tmp".into()
+            })
+        );
+    }
+
+    #[test]
+    fn unit_file_refuses_a_property_without_a_value() {
+        let spec = spec(&["add", "--persist", "-p", "--", "make"]);
+        assert_eq!(
+            unit_file(&s("build"), &spec),
+            Err(ParseError::UnsupportedOverride { value: "-p".into() })
+        );
+    }
+
     #[test]
     fn list_and_clean_take_no_arguments() {
         assert_eq!(parse(&os(&["list"])), Ok(Action::List));
@@ -556,6 +807,13 @@ mod tests {
             }
             .to_string(),
             "invalid BGRUN_PREFIX \"a[b\": use only ASCII letters, digits, '-' and '_'"
+        );
+        assert_eq!(
+            ParseError::UnsupportedOverride {
+                value: "--setenv=A=1".into()
+            }
+            .to_string(),
+            "cannot persist \"--setenv=A=1\": only -p KEY=VALUE overrides can be written to a unit file"
         );
     }
 }

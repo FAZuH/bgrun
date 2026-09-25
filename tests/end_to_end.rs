@@ -81,6 +81,16 @@ impl Sandbox {
         );
     }
 
+    /// Make a shim fail for one verb only, so the steps around it still run.
+    fn fail_verb(&self, name: &str, verb: &str, message: &str) {
+        self.shim(
+            name,
+            &format!(
+                "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \" $* \" in *' {verb} '*) echo '{message}' >&2; exit 1;; esac\n"
+            ),
+        );
+    }
+
     /// Make `loginctl` report that lingering is off.
     fn linger_disabled(&self) {
         self.shim(
@@ -93,6 +103,18 @@ impl Sandbox {
         self.run_with(args, &[])
     }
 
+    /// Where a persisted job's unit file lands: bgrun resolves
+    /// `$XDG_CONFIG_HOME/systemd/user`, which points into the sandbox.
+    fn unit_file(&self, name: &str) -> PathBuf {
+        self.root.join("systemd").join("user").join(name)
+    }
+
+    fn write_unit_file(&self, name: &str) {
+        let path = self.unit_file(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[Service]\nExecStart=true\n").unwrap();
+    }
+
     fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bgrun"));
         command
@@ -100,6 +122,7 @@ impl Sandbox {
             .env("PATH", self.root.join("bin"))
             .env("BGRUN_TEST_LOG", &self.log)
             .env_remove("BGRUN_PREFIX")
+            .env("XDG_CONFIG_HOME", &self.root)
             .env("USER", "tester");
         for (key, value) in env {
             command.env(key, value);
@@ -231,6 +254,140 @@ fn add_forwards_overrides_verbatim() {
             "systemd-run --user --unit=bgrun-build.service --collect -p WorkingDirectory=/tmp make"
         )
         .len() == 1);
+}
+
+#[test]
+fn restart_becomes_a_systemd_property_on_the_transient_unit() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["add", "--restart", "--", "sleep", "5"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(
+        sandbox
+            .calls_containing(
+                "systemd-run --user --unit=bgrun-sleep.service --collect -p Restart=on-failure sleep 5"
+            )
+            .len()
+            == 1,
+        "calls: {:?}",
+        sandbox.calls()
+    );
+}
+
+// ---------------------------------------------------------- persistence --
+
+#[test]
+fn persist_writes_an_enabled_unit_file_instead_of_running_systemd_run() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&[
+        "add",
+        "build",
+        "--persist",
+        "-p",
+        "MemoryMax=1G",
+        "--",
+        "make",
+    ]);
+
+    assert_eq!(code(&output), 0);
+    let body = fs::read_to_string(sandbox.unit_file("bgrun-build.service"))
+        .expect("unit file was written");
+    assert!(body.contains("ExecStart=\"make\"\n"), "{body}");
+    assert!(body.contains("MemoryMax=1G\n"), "{body}");
+    assert!(body.contains("WantedBy=default.target\n"), "{body}");
+
+    let calls = sandbox.calls();
+    let position = |needle: &str| {
+        calls
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing call containing {needle:?} in {calls:?}"))
+    };
+    assert!(
+        position("systemctl --user daemon-reload")
+            < position("systemctl --user enable --now bgrun-build.service")
+    );
+    assert!(
+        calls.iter().all(|line| !line.contains("systemd-run")),
+        "a persisted job is a unit file, not a transient unit: {calls:?}"
+    );
+    assert!(stdout(&output).contains("persisted: bgrun-build.service"));
+}
+
+#[test]
+fn persist_rejects_an_override_it_cannot_write_before_touching_disk() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["add", "--persist", "--working-directory=/tmp", "--", "make"]);
+
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("only -p KEY=VALUE overrides"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert!(!sandbox.unit_file("bgrun-make.service").exists());
+    assert!(sandbox.calls_containing("systemctl").is_empty());
+    assert!(sandbox.calls_containing("systemd-run").is_empty());
+}
+
+#[test]
+fn a_unit_systemd_refuses_is_not_left_wired_into_every_boot() {
+    let sandbox = Sandbox::new();
+    sandbox.fail_verb("systemctl", "enable", "Failed to prepare unit");
+
+    let output = sandbox.run(&["add", "build", "--persist", "--", "make"]);
+
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("Failed to prepare unit"));
+    assert!(
+        !sandbox.unit_file("bgrun-build.service").exists(),
+        "a refused unit file must not be left behind to fail at every boot"
+    );
+    assert!(
+        sandbox
+            .calls_containing("systemctl --user disable bgrun-build.service")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn remove_deletes_the_unit_file_of_a_persisted_job() {
+    let sandbox = Sandbox::new();
+    sandbox.write_unit_file("bgrun-build.service");
+
+    let output = sandbox.run(&["remove", "build"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(!sandbox.unit_file("bgrun-build.service").exists());
+    assert!(
+        sandbox
+            .calls_containing("systemctl --user disable bgrun-build.service")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn remove_says_nothing_about_transient_jobs() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["remove", "a"]);
+
+    assert_eq!(code(&output), 0);
+    let calls = sandbox.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "a transient job has no unit file to disable: {calls:?}"
+    );
+    assert!(
+        calls[0].ends_with("systemctl --user stop bgrun-a.service"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[1].ends_with("systemctl --user reset-failed bgrun-a.service"),
+        "{calls:?}"
+    );
 }
 
 // ------------------------------------------------------- introspection --
