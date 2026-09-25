@@ -1,3 +1,10 @@
+## [0.1.2](https://github.com/FAZuH/bgrun/compare/v0.1.1...v0.1.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* **cli:** take the flags without add, and refuse to shadow a running job ([3e7734a](https://github.com/FAZuH/bgrun/commit/3e7734ae4b3b41da366da6bf861a9b6a2845d74e))
+
 ## [0.1.1](https://github.com/FAZuH/bgrun/compare/v0.1.0...v0.1.1) (2026-09-25)
 
 
