@@ -101,15 +101,23 @@ fn run(prefix: &Prefix, spec: RunSpec) -> ExitCode {
 /// Back the job with a real unit file so it starts on every boot. Nothing
 /// transient can do this — see [`bgrun::unit_file`].
 fn persist(prefix: &Prefix, name: &JobName, spec: &RunSpec) -> ExitCode {
-    let Some(dir) = user_unit_dir() else {
-        return fail(ParseError::NoUnitDirectory);
-    };
-    let unit = prefix.unit(name);
-    let path = dir.join(&unit);
     let body = match bgrun::unit_file(name, spec) {
         Ok(body) => body,
         Err(error) => return fail(error),
     };
+    let Some(dir) = user_unit_dir() else {
+        return fail(ParseError::NoUnitDirectory);
+    };
+    let unit = prefix.unit(name);
+    // A loaded transient unit of the same name wins name resolution over the
+    // file we are about to write, and `systemctl enable` calls it
+    // "transient or generated". Refuse before writing anything.
+    if transient_shadow(&unit) {
+        eprintln!("error: {unit} is already running as a transient job");
+        eprintln!("  stop it first: bgrun remove {name}");
+        return ExitCodes::failure();
+    }
+    let path = dir.join(&unit);
     if let Err(error) = fs::create_dir_all(&dir).and_then(|()| fs::write(&path, body)) {
         eprintln!("error: cannot write {}: {error}", path.display());
         return ExitCodes::failure();
@@ -216,6 +224,23 @@ fn user_unit_dir() -> Option<PathBuf> {
     Some(base.join("systemd").join("user"))
 }
 
+/// Whether a transient unit of this name is currently loaded. Persisting
+/// over one is impossible: the manager keeps the name, `systemctl enable`
+/// refuses it, and the unit file would only take effect after the transient
+/// unit is gone.
+fn transient_shadow(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property=UnitFileState",
+            "--value",
+        ])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "transient")
+}
+
 /// Disable and delete a persisted job's unit file, so it does not come back
 /// at the next boot. A transient job has no file on disk, so this does
 /// nothing at all for it and `remove` stays as quiet as it was.
@@ -262,8 +287,8 @@ fn help(prefix: &Prefix) -> String {
         "bgrun — run commands in the background as systemd user units
 
 Usage:
-  bgrun -- <command> [args...]               run in bg; name auto-derived
-  bgrun add [NAME] [flags] [overrides] -- <cmd>   run in bg, optional name
+  bgrun [--flags] [overrides] -- <cmd>      run in bg; name auto-derived
+  bgrun add [NAME] [flags] [overrides] -- <cmd>   same, with a name
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
@@ -281,11 +306,12 @@ systemd-run, so you can override unit properties like WorkingDirectory:
   bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
   bgrun add backup -- rsync -a ~/src/ /mnt/backup/
 
-Flags for 'add' (go after [NAME], before any override):
+Flags (either form, in front of the overrides):
   --restart    restart the command when it exits non-zero
                (systemd's own limit still applies: 5 starts per 10s)
   --persist    write a unit file and enable it, so the job also runs at
-               every boot. Only -p KEY=VALUE overrides can be persisted.
+               every boot. Only -p KEY=VALUE overrides can be persisted,
+               and the name must not be taken by a running transient job.
 
 Notes:
   - Units are transient (--collect): finished jobs disappear on their own;

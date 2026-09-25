@@ -29,7 +29,7 @@ bgrun -- make -j8     # correct
 
 | command | what it does |
 |---|---|
-| `bgrun -- <cmd> [args]` | run in the background, name from the command's basename |
+| `bgrun [--flags] [overrides] -- <cmd>` | run in the background, name from the command's basename |
 | `bgrun add [NAME] [flags] [overrides] -- <cmd>` | same, with an explicit name |
 | `bgrun list` | every `bgrun-*` unit, running or failed |
 | `bgrun status <name>` | systemd status for one job |
@@ -37,13 +37,16 @@ bgrun -- make -j8     # correct
 | `bgrun stop` / `bgrun remove <name>...` | stop and forget (aliases) |
 | `bgrun clean` | forget units that exited non-zero |
 
+`add` is only there to name the job. Reach for the bare form unless the
+user has a name in mind.
+
 ## Naming
 
 `bgrun add` takes the first token as the name when it does not start with `-`;
 otherwise the name is the command's basename. Characters outside
-`[A-Za-z0-9:_.-]` become `-`. Names are global to the prefix: adding a job
-whose name is taken fails, and the error tells you to `bgrun logs` or
-`bgrun remove` it first — do not invent a second name to work around it.
+`[A-Za-z0-9:_.-]` become `-`. Names are global to the prefix: a second job with
+a taken name fails — for a transient job the error points at `bgrun logs` and
+`bgrun remove` — so do not invent a second name to work around it.
 
 Give a name anything you will want to type later. `bgrun add build -- make -j8`
 beats a derived `bgrun-make` you have to remember.
@@ -62,10 +65,10 @@ bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 
 ## Long-lived jobs
 
-Two flags, both on `bgrun add`, both after the name:
+Two flags, in front of the overrides, in either form:
 
 ```sh
-bgrun add api --restart -- ./server
+bgrun --restart -- ./server
 bgrun add sync --persist -- ./sync.sh ~/data
 ```
 
@@ -75,7 +78,7 @@ start limit still applies — 5 starts per 10 seconds, then it gives up and
 retry loop is still running.
 
 `--persist` writes a real unit file and enables it, so the job also starts at
-every boot. Three consequences worth respecting:
+every boot. Four consequences worth respecting:
 
 - It needs **lingering** (`loginctl enable-linger $USER`) to start at boot;
   without it the job starts at your next login instead.
@@ -83,6 +86,10 @@ every boot. Three consequences worth respecting:
   returns at every boot. Never `--persist` something you cannot name later.
 - Only `-p KEY=VALUE` overrides can be written to a unit file;
   `--working-directory=` and friends are rejected instead of silently dropped.
+- If the name is already taken by a running transient job, bgrun refuses and
+  tells the user to `bgrun remove` it first. It cannot adopt a running job,
+  so do not try to work around this by renaming — the user has to decide
+  whether the running job may be stopped.
 
 ## After launching
 

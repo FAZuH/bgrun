@@ -91,6 +91,16 @@ impl Sandbox {
         );
     }
 
+    /// Make `systemctl show <unit> -p UnitFileState` report `state`.
+    fn unit_state(&self, state: &str) {
+        self.shim(
+            "systemctl",
+            &format!(
+                "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *UnitFileState*) echo {state}; exit 0;; esac\n"
+            ),
+        );
+    }
+
     /// Make `loginctl` report that lingering is off.
     fn linger_disabled(&self) {
         self.shim(
@@ -274,6 +284,24 @@ fn restart_becomes_a_systemd_property_on_the_transient_unit() {
     );
 }
 
+#[test]
+fn bare_run_accepts_the_same_flags() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--restart", "-p", "MemoryMax=1G", "--", "sleep", "5"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(
+        sandbox
+            .calls_containing(
+                "systemd-run --user --unit=bgrun-sleep.service --collect -p Restart=on-failure -p MemoryMax=1G sleep 5"
+            )
+            .len()
+            == 1,
+        "calls: {:?}",
+        sandbox.calls()
+    );
+}
+
 // ---------------------------------------------------------- persistence --
 
 #[test]
@@ -312,6 +340,37 @@ fn persist_writes_an_enabled_unit_file_instead_of_running_systemd_run() {
         "a persisted job is a unit file, not a transient unit: {calls:?}"
     );
     assert!(stdout(&output).contains("persisted: bgrun-build.service"));
+}
+
+#[test]
+fn persist_refuses_to_shadow_a_running_transient_job() {
+    let sandbox = Sandbox::new();
+    sandbox.unit_state("transient");
+
+    let output = sandbox.run(&["add", "api", "--persist", "--", "make"]);
+
+    assert_eq!(code(&output), 1);
+    let err = stderr(&output);
+    assert!(
+        err.contains("bgrun-api.service is already running as a transient job"),
+        "stderr: {err}"
+    );
+    assert!(err.contains("bgrun remove api"), "stderr: {err}");
+    assert!(!sandbox.unit_file("bgrun-api.service").exists());
+    assert!(sandbox.calls_containing("enable").is_empty());
+}
+
+#[test]
+fn persist_may_replace_an_already_persisted_job() {
+    let sandbox = Sandbox::new();
+    sandbox.write_unit_file("bgrun-api.service");
+    sandbox.unit_state("enabled");
+
+    let output = sandbox.run(&["add", "api", "--persist", "--", "make", "-j8"]);
+
+    assert_eq!(code(&output), 0);
+    let body = fs::read_to_string(sandbox.unit_file("bgrun-api.service")).expect("rewritten");
+    assert!(body.contains("ExecStart=\"make\" \"-j8\"\n"), "{body}");
 }
 
 #[test]
