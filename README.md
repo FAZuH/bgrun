@@ -44,9 +44,9 @@ bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 Two flags of bgrun's own work in either form, in front of the overrides:
 
 ```sh
-bgrun --restart -- ./server               # retry whenever it exits non-zero
-bgrun add api --persist -- ./server       # also runs at every boot
-bgrun --persist -- ./sync.sh ~/data       # name derived, no `add` needed
+bgrun --restart -- ./server               # or -r: retry whenever it exits non-zero
+bgrun add api --persist -- ./server       # or -b: also runs at every boot
+bgrun -b -- ./sync.sh ~/data              # name derived, no `add` needed
 ```
 
 Run `bgrun help` for the full command list.

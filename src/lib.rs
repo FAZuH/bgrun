@@ -285,7 +285,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
     }
 }
 
-/// `add [NAME] [--restart] [--persist] [overrides] -- <command…>`
+/// `add [NAME] [--restart|-r] [--persist|-b] [overrides] -- <command…>`
 fn parse_add(args: &[OsString]) -> Result<Action, ParseError> {
     // Optional NAME: the first token, unless it looks like an option or is
     // the separator itself.
@@ -341,8 +341,10 @@ fn take_flags(args: &[OsString]) -> (Flags, &[OsString]) {
     let mut rest = args;
     while let Some((flag, tail)) = rest.split_first() {
         match flag.to_string_lossy().as_ref() {
-            "--restart" => flags.restart = true,
-            "--persist" => flags.persist = true,
+            // `-r`/`-b` rather than `-p`: `-p` already means
+            // `systemd-run --property` in the override region right behind.
+            "-r" | "--restart" => flags.restart = true,
+            "-b" | "--persist" => flags.persist = true,
             _ => break,
         }
         rest = tail;
@@ -658,6 +660,20 @@ mod tests {
         let spec = spec(&["add", "build", "--persist", "--", "make"]);
         assert!(spec.persist);
         assert!(spec.systemd_opts.is_empty());
+    }
+
+    #[test]
+    fn the_flags_have_short_forms() {
+        assert_eq!(
+            spec(&["add", "-r", "--", "make"]).systemd_opts,
+            spec(&["add", "--restart", "--", "make"]).systemd_opts
+        );
+        assert!(spec(&["add", "-b", "--", "make"]).persist);
+        // `-p` belongs to systemd-run, not to bgrun.
+        assert!(
+            spec(&["add", "-p", "Restart=always", "--", "make"]).systemd_opts
+                == os(&["-p", "Restart=always"])
+        );
     }
 
     #[test]

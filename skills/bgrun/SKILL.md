@@ -65,11 +65,12 @@ bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 
 ## Long-lived jobs
 
-Two flags, in front of the overrides, in either form:
+Two flags, in front of the overrides, in either form — `-r` and `-b` are the
+short forms:
 
 ```sh
-bgrun --restart -- ./server
-bgrun add sync --persist -- ./sync.sh ~/data
+bgrun -r -- ./server
+bgrun add sync -b -- ./sync.sh ~/data
 ```
 
 `--restart` sets `Restart=on-failure`, so a crash is retried. systemd's own

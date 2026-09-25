@@ -307,9 +307,9 @@ systemd-run, so you can override unit properties like WorkingDirectory:
   bgrun add backup -- rsync -a ~/src/ /mnt/backup/
 
 Flags (either form, in front of the overrides):
-  --restart    restart the command when it exits non-zero
-               (systemd's own limit still applies: 5 starts per 10s)
-  --persist    write a unit file and enable it, so the job also runs at
+  -r, --restart    restart the command when it exits non-zero
+                   (systemd's own limit still applies: 5 starts per 10s)
+  -b, --persist    write a unit file and enable it, so the job also runs at
                every boot. Only -p KEY=VALUE overrides can be persisted,
                and the name must not be taken by a running transient job.
 
