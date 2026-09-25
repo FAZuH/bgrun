@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::process::ExitStatus;
 use std::process::Output;
@@ -208,6 +209,11 @@ pub enum ParseError {
     /// A `systemd-run -p` / `--property` with no `KEY=VALUE` behind it, which
     /// would take the command's first word as its value.
     MissingPropertyValue,
+    /// A `--persist` command that is a bare name and is in nobody's `PATH`.
+    /// A unit file would fail with 203/EXEC at every boot.
+    CommandNotFound {
+        command: String,
+    },
     /// Neither `XDG_CONFIG_HOME` nor `HOME` is set, so the systemd user
     /// unit directory cannot be located.
     NoUnitDirectory,
@@ -240,6 +246,10 @@ impl fmt::Display for ParseError {
             Self::MissingPropertyValue => write!(
                 f,
                 "-p needs a KEY=VALUE (it is systemd-run's --property); bgrun's own flags are -r/--restart and -b/--persist"
+            ),
+            Self::CommandNotFound { command } => write!(
+                f,
+                "cannot persist {command:?}: not an executable in PATH. A unit file only searches systemd's own list, so give the absolute path"
             ),
             Self::NoUnitDirectory => write!(
                 f,
@@ -424,6 +434,10 @@ fn names_for(action: &str, rest: &[OsString]) -> Result<Vec<JobName>, ParseError
 /// and `systemctl enable` calls such a unit "transient or generated" — so
 /// `--persist` writes this file and lets `enable --now` do the rest.
 pub fn unit_file(name: &JobName, spec: &RunSpec) -> Result<String, ParseError> {
+    // Overrides first: they are pure validation, while resolving the command
+    // touches the filesystem, and the cheaper failure is the better message.
+    let properties = property_lines(&spec.systemd_opts)?;
+    let exec_start = exec_start(&spec.command)?;
     let mut lines = vec![
         format!("# bgrun job \"{name}\" — regenerate with `bgrun add`, not by hand."),
         "[Unit]".to_owned(),
@@ -434,12 +448,12 @@ pub fn unit_file(name: &JobName, spec: &RunSpec) -> Result<String, ParseError> {
         String::new(),
         "[Service]".to_owned(),
         "Type=simple".to_owned(),
-        format!("ExecStart={}", exec_start(&spec.command)),
+        format!("ExecStart={exec_start}"),
     ];
     // ponytail: every property lands in [Service], so a [Unit]-only key
     // (Requires=, After=) is dropped by systemd with a warning. Splitting
     // them apart needs a key table nobody has asked for yet.
-    lines.extend(property_lines(&spec.systemd_opts)?);
+    lines.extend(properties);
     lines.push(String::new());
     lines.push("[Install]".to_owned());
     lines.push("WantedBy=default.target".to_owned());
@@ -476,19 +490,54 @@ fn property_lines(opts: &[OsString]) -> Result<Vec<String>, ParseError> {
     Ok(lines)
 }
 
-/// One `ExecStart=` line. Tokens are double-quoted because systemd unescapes
-/// `\\` and `\"` inside quotes, and expands `%` specifiers, so a literal
-/// percent sign has to be written `%%`.
+/// One `ExecStart=` line.
+///
+/// The command is resolved to an absolute path first. A unit file searches
+/// only systemd's own fixed list (`/usr/local/sbin:/usr/local/bin:/usr/sbin:
+/// /usr/bin:/sbin:/bin`) for a bare name, while `systemd-run` resolves against
+/// the caller's `PATH` — so without this the same command that works as a
+/// transient job fails with 203/EXEC on every boot. Refusing an unresolvable
+/// name beats a unit file retried at every boot with nobody around to read it.
+///
+/// Tokens are double-quoted because systemd unescapes `\\` and `\"` inside
+/// quotes, and expands `%` specifiers, so a literal percent sign has to be
+/// written `%%`.
 ///
 /// ponytail: `to_string_lossy` mangles a non-UTF-8 argument and `$` is left
 /// to systemd's own unit-file parsing. Both only differ for arguments that
 /// a shell-free invocation was never going to produce.
-fn exec_start(command: &[OsString]) -> String {
-    command
-        .iter()
-        .map(|arg| quote(&arg.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn exec_start(command: &[OsString]) -> Result<String, ParseError> {
+    let Some(argv0) = command.first() else {
+        return Err(ParseError::MissingCommand);
+    };
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let mut tokens = vec![quote(
+        &resolve_executable(argv0, &search)?.to_string_lossy(),
+    )];
+    tokens.extend(command[1..].iter().map(|arg| quote(&arg.to_string_lossy())));
+    Ok(tokens.join(" "))
+}
+
+/// Absolute path for an `ExecStart` command, searched for in `search` when the
+/// name is bare. A name containing a `/` is left to systemd, so `./script.sh`
+/// keeps meaning "relative to the unit's working directory".
+fn resolve_executable(argv0: &OsStr, search: &OsStr) -> Result<PathBuf, ParseError> {
+    let name = argv0.to_string_lossy();
+    if name.contains('/') {
+        return Ok(PathBuf::from(argv0));
+    }
+    std::env::split_paths(search)
+        .map(|dir| dir.join(argv0))
+        .find(|candidate| is_executable(candidate))
+        .ok_or_else(|| ParseError::CommandNotFound {
+            command: name.into_owned(),
+        })
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 fn quote(arg: &str) -> String {
@@ -510,6 +559,9 @@ fn quote(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn os(args: &[&str]) -> Vec<OsString> {
@@ -766,8 +818,11 @@ mod tests {
 
     #[test]
     fn unit_file_enables_the_job_at_every_boot() {
-        let body = body("build", &["add", "build", "--", "make", "-j8"]);
-        assert!(body.contains("ExecStart=\"make\" \"-j8\"\n"), "{body}");
+        let body = body("build", &["add", "build", "--", "/usr/bin/make", "-j8"]);
+        assert!(
+            body.contains("ExecStart=\"/usr/bin/make\" \"-j8\"\n"),
+            "{body}"
+        );
         assert!(body.contains("CollectMode=inactive-or-failed"), "{body}");
         assert!(
             body.contains("[Install]\nWantedBy=default.target\n"),
@@ -785,12 +840,14 @@ mod tests {
                 "--restart",
                 "-pMemoryMax=1G",
                 "--",
-                "wget",
+                "/usr/bin/wget",
                 "url",
             ],
         );
         assert!(
-            body.contains("ExecStart=\"wget\" \"url\"\nRestart=on-failure\nMemoryMax=1G\n"),
+            body.contains(
+                "ExecStart=\"/usr/bin/wget\" \"url\"\nRestart=on-failure\nMemoryMax=1G\n"
+            ),
             "{body}"
         );
     }
@@ -800,9 +857,81 @@ mod tests {
         // A unit file expands `%` specifiers (a transient `-p` does not), and
         // unescapes `\\` and `\"` inside quotes.
         let body = body("q", &["add", "--", "echo", "50%", "\"q\"", "c:\\x"]);
+        let echo = resolve_executable(
+            OsStr::new("echo"),
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )
+        .expect("echo is in PATH");
         assert!(
-            body.contains(r#"ExecStart="echo" "50%%" "\"q\"" "c:\\x""#),
+            body.contains(&format!("ExecStart={} ", quote(&echo.to_string_lossy()))),
             "{body}"
+        );
+        assert!(body.contains(r#" "50%%" "\"q\"" "c:\\x""#), "{body}");
+    }
+
+    /// A unit file searches only systemd's own list for a bare name, so
+    /// `systemd-run`'s PATH resolution has to be done here or the job fails
+    /// with 203/EXEC at every boot. Verified against the two machines that
+    /// reported exactly that.
+    #[test]
+    fn a_bare_command_is_resolved_the_way_systemd_run_resolves_it() {
+        let dir = std::env::temp_dir().join(format!("bgrun-exec-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("bgrun-fake-tool");
+        fs::write(&tool, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let search = std::env::join_paths([&dir]).unwrap();
+
+        assert_eq!(
+            resolve_executable(OsStr::new("bgrun-fake-tool"), &search).unwrap(),
+            tool
+        );
+        assert_eq!(
+            resolve_executable(OsStr::new("bgrun-absent-tool"), &search),
+            Err(ParseError::CommandNotFound {
+                command: "bgrun-absent-tool".into()
+            })
+        );
+        // A name with a slash stays systemd's business: `./script.sh` keeps
+        // meaning "relative to the unit's working directory".
+        assert_eq!(
+            resolve_executable(OsStr::new("./script.sh"), &search).unwrap(),
+            PathBuf::from("./script.sh")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_executable_file_is_not_a_command() {
+        let dir = std::env::temp_dir().join(format!("bgrun-noexec-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bgrun-plain-file");
+        fs::write(&file, "not a program").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let search = std::env::join_paths([&dir]).unwrap();
+
+        assert_eq!(
+            resolve_executable(OsStr::new("bgrun-plain-file"), &search),
+            Err(ParseError::CommandNotFound {
+                command: "bgrun-plain-file".into()
+            })
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unit_file_refuses_a_command_the_manager_could_not_run() {
+        let spec = RunSpec {
+            name: Some(s("api")),
+            systemd_opts: vec![],
+            command: os(&["bgrun-no-such-command-anywhere"]),
+            persist: true,
+        };
+        assert_eq!(
+            unit_file(&s("api"), &spec),
+            Err(ParseError::CommandNotFound {
+                command: "bgrun-no-such-command-anywhere".into()
+            })
         );
     }
 

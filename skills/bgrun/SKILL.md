@@ -93,6 +93,9 @@ every boot. Four consequences worth respecting:
   returns at every boot. Never `--persist` something you cannot name later.
 - Only `-p KEY=VALUE` overrides can be written to a unit file;
   `--working-directory=` and friends are rejected instead of silently dropped.
+- The command is written as an absolute path, resolved from `PATH` the way
+  `systemd-run` resolves it. A name that is an executable nowhere is refused;
+  do not work around it by hand-editing the unit file.
 - If the name is already taken by a running transient job, bgrun refuses and
   tells the user to `bgrun remove` it first. It cannot adopt a running job,
   so do not try to work around this by renaming — the user has to decide

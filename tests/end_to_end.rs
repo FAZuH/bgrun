@@ -113,6 +113,14 @@ impl Sandbox {
         self.run_with(args, &[])
     }
 
+    /// An executable inside the sandbox's bin, which is all a test's `PATH`
+    /// contains: a bare command name a persisted job can resolve to an
+    /// absolute path. Returns that path for the `ExecStart=` assertion.
+    fn job_tool(&self, name: &str) -> PathBuf {
+        self.shim(name, "exit 0\n");
+        self.root.join("bin").join(name)
+    }
+
     /// Where a persisted job's unit file lands: bgrun resolves
     /// `$XDG_CONFIG_HOME/systemd/user`, which points into the sandbox.
     fn unit_file(&self, name: &str) -> PathBuf {
@@ -307,6 +315,7 @@ fn bare_run_accepts_the_same_flags() {
 #[test]
 fn persist_writes_an_enabled_unit_file_instead_of_running_systemd_run() {
     let sandbox = Sandbox::new();
+    let tool = sandbox.job_tool("bgrun-job-tool");
     let output = sandbox.run(&[
         "add",
         "build",
@@ -314,13 +323,16 @@ fn persist_writes_an_enabled_unit_file_instead_of_running_systemd_run() {
         "-p",
         "MemoryMax=1G",
         "--",
-        "make",
+        "bgrun-job-tool",
     ]);
 
     assert_eq!(code(&output), 0);
     let body = fs::read_to_string(sandbox.unit_file("bgrun-build.service"))
         .expect("unit file was written");
-    assert!(body.contains("ExecStart=\"make\"\n"), "{body}");
+    assert!(
+        body.contains(&format!("ExecStart=\"{}\"\n", tool.display())),
+        "{body}"
+    );
     assert!(body.contains("MemoryMax=1G\n"), "{body}");
     assert!(body.contains("WantedBy=default.target\n"), "{body}");
 
@@ -346,8 +358,9 @@ fn persist_writes_an_enabled_unit_file_instead_of_running_systemd_run() {
 fn persist_refuses_to_shadow_a_running_transient_job() {
     let sandbox = Sandbox::new();
     sandbox.unit_state("transient");
+    sandbox.job_tool("bgrun-job-tool");
 
-    let output = sandbox.run(&["add", "api", "--persist", "--", "make"]);
+    let output = sandbox.run(&["add", "api", "--persist", "--", "bgrun-job-tool"]);
 
     assert_eq!(code(&output), 1);
     let err = stderr(&output);
@@ -363,14 +376,44 @@ fn persist_refuses_to_shadow_a_running_transient_job() {
 #[test]
 fn persist_may_replace_an_already_persisted_job() {
     let sandbox = Sandbox::new();
+    let tool = sandbox.job_tool("bgrun-job-tool");
     sandbox.write_unit_file("bgrun-api.service");
     sandbox.unit_state("enabled");
 
-    let output = sandbox.run(&["add", "api", "--persist", "--", "make", "-j8"]);
+    let output = sandbox.run(&["add", "api", "--persist", "--", "bgrun-job-tool", "-j8"]);
 
     assert_eq!(code(&output), 0);
     let body = fs::read_to_string(sandbox.unit_file("bgrun-api.service")).expect("rewritten");
-    assert!(body.contains("ExecStart=\"make\" \"-j8\"\n"), "{body}");
+    assert!(
+        body.contains(&format!("ExecStart=\"{}\" \"-j8\"\n", tool.display())),
+        "{body}"
+    );
+}
+
+#[test]
+fn persist_refuses_a_command_the_unit_manager_could_not_run() {
+    // The sandbox's PATH is only the shim dir, so this name is in nobody's
+    // PATH: a unit file would fail with 203/EXEC at every boot instead.
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["add", "api", "--persist", "--", "bgrun-absent-tool"]);
+
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("not an executable in PATH"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        !sandbox
+            .unit_file("bgrun-bgrun-absent-tool.service")
+            .exists()
+    );
+    assert!(
+        sandbox.calls_containing("systemctl").is_empty(),
+        "nothing may be wired in when the command cannot run: {:?}",
+        sandbox.calls()
+    );
 }
 
 #[test]
@@ -393,8 +436,9 @@ fn persist_rejects_an_override_it_cannot_write_before_touching_disk() {
 fn a_unit_systemd_refuses_is_not_left_wired_into_every_boot() {
     let sandbox = Sandbox::new();
     sandbox.fail_verb("systemctl", "enable", "Failed to prepare unit");
+    sandbox.job_tool("bgrun-job-tool");
 
-    let output = sandbox.run(&["add", "build", "--persist", "--", "make"]);
+    let output = sandbox.run(&["add", "build", "--persist", "--", "bgrun-job-tool"]);
 
     assert_eq!(code(&output), 1);
     assert!(stderr(&output).contains("Failed to prepare unit"));
