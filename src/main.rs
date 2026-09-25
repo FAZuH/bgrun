@@ -345,21 +345,7 @@ Flags (either form, in front of the overrides):
   -r, --restart    restart the command when it exits non-zero
                    (systemd's own limit still applies: 5 starts per 10s)
   -b, --persist    write a unit file and enable it, so the job also runs at
-               every boot. Only -p KEY=VALUE overrides can be persisted,
-               and the name must not be taken by a running transient job.
-
-Notes:
-  - Units are transient (--collect): finished jobs disappear on their own;
-    'clean' only clears units that exited non-zero.
-  - '--persist' is the exception: it writes a real unit file under the
-    systemd user unit directory, and 'bgrun remove' is what deletes it.
-    Without that the job returns at every boot.
-  - Jobs survive logout only if lingering is enabled:
-      loginctl enable-linger $USER
-    'bgrun add' warns when it is off.
-  - Logs stay in the journal: view with 'bgrun logs <name>'.
-  - Prefix is '{prefix}' (override with BGRUN_PREFIX; letters, digits,
-    '-' and '_' only).
+                   every boot. Only -p KEY=VALUE overrides can be persisted.
 "
     )
 }

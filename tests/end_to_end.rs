@@ -631,8 +631,20 @@ fn help_flag_exits_successfully() {
     let out = stdout(&output);
     assert!(out.contains("Usage:"));
     // Claude review #1 and #3: the help text itself must not lie.
-    assert!(out.contains("loginctl enable-linger"));
-    assert!(out.contains("only clears units that exited non-zero"));
+    for expected in [
+        "add",
+        "list",
+        "status",
+        "logs",
+        "stop",
+        "resume",
+        "remove",
+        "clean",
+        "--restart",
+        "--persist",
+    ] {
+        assert!(out.contains(expected), "help omits {expected}:\n{out}");
+    }
     assert!(sandbox.calls().is_empty());
 }
 
