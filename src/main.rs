@@ -37,6 +37,10 @@ fn main() -> ExitCode {
             print!("{}", help(&prefix));
             ExitCode::SUCCESS
         }
+        Action::Version => {
+            println!("bgrun {}", bgrun::VERSION);
+            ExitCode::SUCCESS
+        }
         Action::Run(spec) => run(&prefix, spec),
         Action::List => list(&prefix),
         Action::Status(name) => status(&prefix, &name),
@@ -321,6 +325,8 @@ fn help(prefix: &Prefix) -> String {
         "bgrun — run commands in the background as systemd user units
 
 Usage:
+  bgrun help | -h | --help
+  bgrun -V | --version
   bgrun [--flags] [overrides] -- <cmd>      run in bg; name auto-derived
   bgrun add [NAME] [flags] [overrides] -- <cmd>   same, with a name
   bgrun list

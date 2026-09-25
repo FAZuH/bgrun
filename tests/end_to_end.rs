@@ -649,6 +649,19 @@ fn help_flag_exits_successfully() {
 }
 
 #[test]
+fn version_prints_the_manifest_version_and_shells_out_to_nothing() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["--version"]);
+
+    assert_eq!(code(&output), 0);
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("bgrun {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(sandbox.calls().is_empty());
+}
+
+#[test]
 fn unknown_command_exits_with_usage_code() {
     let sandbox = Sandbox::new();
     let output = sandbox.run(&["wat"]);

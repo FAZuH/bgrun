@@ -12,6 +12,10 @@ use std::process::ExitCode;
 use std::process::ExitStatus;
 use std::process::Output;
 
+/// Version reported by `bgrun --version`. Patched by CI on the release
+/// branch, so it is read from the manifest rather than written down twice.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Exit code for usage errors (bad arguments, unknown command).
 pub const EXIT_USAGE: u8 = 2;
 /// Exit code for runtime failures.
@@ -160,6 +164,7 @@ pub struct RunSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Help,
+    Version,
     Run(RunSpec),
     List,
     Status(JobName),
@@ -254,6 +259,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
 
     match &*first {
         "help" | "-h" | "--help" => Ok(Action::Help),
+        "version" | "-V" | "--version" => Ok(Action::Version),
         "add" => parse_add(rest),
         // The bare form is `add` with the name left to be derived, so a
         // leading option can only be one of ours or an override — never a
@@ -581,6 +587,13 @@ mod tests {
     #[test]
     fn no_arguments_is_help() {
         assert_eq!(parse(&[]), Ok(Action::Help));
+    }
+
+    #[test]
+    fn version_flags() {
+        for flag in ["version", "-V", "--version"] {
+            assert_eq!(parse(&os(&[flag])), Ok(Action::Version), "flag: {flag}");
+        }
     }
 
     #[test]
