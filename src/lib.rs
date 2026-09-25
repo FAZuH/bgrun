@@ -167,8 +167,13 @@ pub enum Action {
         name: JobName,
         journalctl_opts: Vec<OsString>,
     },
-    /// Stop and forget units. `stop` and `remove` are aliases (both stop,
-    /// reset the failure record, and confirm).
+    /// Stop units for now; `resume` starts them again. Only a persisted job
+    /// survives a stop — a transient one is collected as it goes inactive.
+    Stop(Vec<JobName>),
+    /// Start stopped units again.
+    Resume(Vec<JobName>),
+    /// Stop and forget units for good: a persisted job's unit file is
+    /// deleted, so it does not come back at the next boot.
     Remove(Vec<JobName>),
     Clean,
 }
@@ -269,23 +274,16 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
                 journalctl_opts: rest[1..].to_vec(),
             })
         }
-        "stop" | "remove" => {
-            if rest.is_empty() {
-                return Err(ParseError::MissingArgument {
-                    action: first.to_string(),
-                });
-            }
-            Ok(Action::Remove(
-                rest.iter().map(|n| JobName::parse(n)).collect(),
-            ))
-        }
+        "stop" => names_for(&first, rest).map(Action::Stop),
+        "resume" => names_for(&first, rest).map(Action::Resume),
+        "remove" => names_for(&first, rest).map(Action::Remove),
         other => Err(ParseError::UnknownCommand {
             command: other.to_owned(),
         }),
     }
 }
 
-/// `add [NAME] [--restart] [--persist] [overrides] -- <command…>`
+/// `add [NAME] [--restart|-r] [--persist|-b] [overrides] -- <command…>`
 fn parse_add(args: &[OsString]) -> Result<Action, ParseError> {
     // Optional NAME: the first token, unless it looks like an option or is
     // the separator itself.
@@ -341,8 +339,10 @@ fn take_flags(args: &[OsString]) -> (Flags, &[OsString]) {
     let mut rest = args;
     while let Some((flag, tail)) = rest.split_first() {
         match flag.to_string_lossy().as_ref() {
-            "--restart" => flags.restart = true,
-            "--persist" => flags.persist = true,
+            // `-r`/`-b` rather than `-p`: `-p` already means
+            // `systemd-run --property` in the override region right behind.
+            "-r" | "--restart" => flags.restart = true,
+            "-b" | "--persist" => flags.persist = true,
             _ => break,
         }
         rest = tail;
@@ -375,6 +375,16 @@ fn expect_no_args(action: &str, rest: &[OsString]) -> Result<(), ParseError> {
             action: action.to_owned(),
         })
     }
+}
+
+/// One or more job names, as every name-taking subcommand needs.
+fn names_for(action: &str, rest: &[OsString]) -> Result<Vec<JobName>, ParseError> {
+    if rest.is_empty() {
+        return Err(ParseError::MissingArgument {
+            action: action.to_owned(),
+        });
+    }
+    Ok(rest.iter().map(|name| JobName::parse(name)).collect())
 }
 
 // ------------------------------------------------------------ unit file --
@@ -661,6 +671,20 @@ mod tests {
     }
 
     #[test]
+    fn the_flags_have_short_forms() {
+        assert_eq!(
+            spec(&["add", "-r", "--", "make"]).systemd_opts,
+            spec(&["add", "--restart", "--", "make"]).systemd_opts
+        );
+        assert!(spec(&["add", "-b", "--", "make"]).persist);
+        // `-p` belongs to systemd-run, not to bgrun.
+        assert!(
+            spec(&["add", "-p", "Restart=always", "--", "make"]).systemd_opts
+                == os(&["-p", "Restart=always"])
+        );
+    }
+
+    #[test]
     fn bare_run_takes_the_same_flags_as_add() {
         let spec = spec(&["--restart", "--persist", "--", "make"]);
         assert!(spec.persist);
@@ -811,21 +835,28 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_remove_accept_multiple_names() {
+    fn stop_resume_and_remove_are_separate_actions() {
         assert_eq!(
             parse(&os(&["stop", "a", "b"])),
-            Ok(Action::Remove(vec![s("a"), s("b")]))
+            Ok(Action::Stop(vec![s("a"), s("b")]))
+        );
+        assert_eq!(
+            parse(&os(&["resume", "a"])),
+            Ok(Action::Resume(vec![s("a")]))
         );
         assert_eq!(
             parse(&os(&["remove", "a"])),
             Ok(Action::Remove(vec![s("a")]))
         );
-        assert_eq!(
-            parse(&os(&["stop"])),
-            Err(ParseError::MissingArgument {
-                action: "stop".into()
-            })
-        );
+        for action in ["stop", "resume", "remove"] {
+            assert_eq!(
+                parse(&os(&[action])),
+                Err(ParseError::MissingArgument {
+                    action: action.into()
+                }),
+                "action: {action}"
+            );
+        }
     }
 
     #[test]

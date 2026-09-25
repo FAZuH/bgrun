@@ -29,7 +29,9 @@ bgrun -- make -j8                # run in background, name auto-derived ("make")
 bgrun add dl -- wget URL         # named job "dl"
 bgrun list                       # all bgrun-* units
 bgrun logs dl                    # journalctl for the job
-bgrun remove dl                  # stop and forget the unit
+bgrun stop dl                    # stop for now, keep the job
+bgrun resume dl                  # start it again
+bgrun remove dl                  # stop and forget it for good
 ```
 
 The command must come after `--`. The job name defaults to the command's
@@ -44,9 +46,9 @@ bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 Two flags of bgrun's own work in either form, in front of the overrides:
 
 ```sh
-bgrun --restart -- ./server               # retry whenever it exits non-zero
-bgrun add api --persist -- ./server       # also runs at every boot
-bgrun --persist -- ./sync.sh ~/data       # name derived, no `add` needed
+bgrun --restart -- ./server               # or -r: retry whenever it exits non-zero
+bgrun add api --persist -- ./server       # or -b: also runs at every boot
+bgrun -b -- ./sync.sh ~/data              # name derived, no `add` needed
 ```
 
 Run `bgrun help` for the full command list.
@@ -58,6 +60,9 @@ Run `bgrun help` for the full command list.
   `loginctl enable-linger $USER`. `bgrun add` warns when it is off.
 - Successful jobs disappear on their own (transient `--collect` units);
   `bgrun clean` only clears units that exited non-zero.
+- `bgrun stop` is temporary and `bgrun resume` undoes it, but only for a
+  job added with `--persist`: a transient unit is collected the moment it
+  stops, so stopping one is final. `bgrun remove` is the only way to be sure.
 - `--restart` is `Restart=on-failure`, so systemd's own start limit still
   applies: 5 starts per 10s, after which the job gives up and is collected.
 - `--persist` is the one thing that is not transient — a transient unit

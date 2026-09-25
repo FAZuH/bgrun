@@ -34,7 +34,9 @@ bgrun -- make -j8     # correct
 | `bgrun list` | every `bgrun-*` unit, running or failed |
 | `bgrun status <name>` | systemd status for one job |
 | `bgrun logs <name> [journalctl opts]` | its journal, e.g. `--follow`, `-n 200` |
-| `bgrun stop` / `bgrun remove <name>...` | stop and forget (aliases) |
+| `bgrun stop <name>...` | stop for now, keeping the job |
+| `bgrun resume <name>...` | start a stopped job again |
+| `bgrun remove <name>...` | stop and forget for good |
 | `bgrun clean` | forget units that exited non-zero |
 
 `add` is only there to name the job. Reach for the bare form unless the
@@ -65,11 +67,12 @@ bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 
 ## Long-lived jobs
 
-Two flags, in front of the overrides, in either form:
+Two flags, in front of the overrides, in either form — `-r` and `-b` are the
+short forms:
 
 ```sh
-bgrun --restart -- ./server
-bgrun add sync --persist -- ./sync.sh ~/data
+bgrun -r -- ./server
+bgrun add sync -b -- ./sync.sh ~/data
 ```
 
 `--restart` sets `Restart=on-failure`, so a crash is retried. systemd's own
@@ -91,6 +94,14 @@ every boot. Four consequences worth respecting:
   so do not try to work around this by renaming — the user has to decide
   whether the running job may be stopped.
 
+## Pausing instead of removing
+
+`bgrun stop <name>` is the temporary one and `bgrun resume <name>` starts it
+again — but only for a job added with `-b`. A transient job is collected the
+moment it stops, so `bgrun resume` answers "Unit not found" and only
+`bgrun remove` was ever going to be a clean way to end it. Never promise the
+user a `stop`/`resume` cycle for a job launched without `-b`.
+
 ## After launching
 
 `bgrun add` returning 0 means systemd accepted the unit, not that the command
@@ -100,7 +111,8 @@ the job as running.
 
 Clean up when the job is done: `bgrun remove <name>`. Successful transient
 jobs delete themselves, but a failed one lingers as a `failed` unit until
-`bgrun clean` or `bgrun remove`.
+`bgrun clean` or `bgrun remove`. Reach for `bgrun stop` only when the user
+wants the job back later.
 
 ## Gotchas
 
