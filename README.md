@@ -70,7 +70,10 @@ Run `bgrun help` for the full command list.
   directory (`~/.config/systemd/user`) and enables it. Only `-p KEY=VALUE`
   overrides can be written to a unit file. The job then starts at every boot,
   which is exactly why `bgrun remove` is what deletes that file again. A name
-  already taken by a running transient job is refused: stop it first.
+  already taken by a running transient job is refused: stop it first. The
+  command is resolved to an absolute path exactly as `systemd-run` does,
+  because a unit file only searches systemd's own list for a bare name — a
+  command that is in nobody's `PATH` is refused instead of failing at boot.
 - The unit prefix is `bgrun`, override with `BGRUN_PREFIX` (letters, digits,
   `-` and `_` only).
 
