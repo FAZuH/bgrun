@@ -449,6 +449,58 @@ fn remove_says_nothing_about_transient_jobs() {
     );
 }
 
+#[test]
+fn stop_keeps_the_job_and_resume_starts_it_again() {
+    let sandbox = Sandbox::new();
+    sandbox.write_unit_file("bgrun-build.service");
+
+    let output = sandbox.run(&["stop", "build"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(stdout(&output).contains("stopped: bgrun-build.service"));
+    assert!(
+        sandbox.unit_file("bgrun-build.service").exists(),
+        "stop must not forget a persisted job"
+    );
+    let calls = sandbox.calls();
+    assert_eq!(calls.len(), 1, "stop is one systemctl call: {calls:?}");
+    assert!(
+        calls[0].ends_with("systemctl --user stop bgrun-build.service"),
+        "{calls:?}"
+    );
+
+    let output = sandbox.run(&["resume", "build"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(stdout(&output).contains("resumed: bgrun-build.service"));
+    assert!(
+        sandbox
+            .calls_containing("systemctl --user start bgrun-build.service")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn a_stop_systemd_refuses_is_reported_as_a_failure() {
+    let sandbox = Sandbox::new();
+    // One named unit fails; the loop must still reach the next name.
+    sandbox.shim(
+        "systemctl",
+        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *bgrun-a.service) echo 'Failed to stop' >&2; exit 1;; esac\n",
+    );
+
+    let output = sandbox.run(&["stop", "a", "b"]);
+
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("Failed to stop"));
+    assert!(!stdout(&output).contains("stopped: bgrun-a.service"));
+    assert!(
+        stdout(&output).contains("stopped: bgrun-b.service"),
+        "one bad name must not skip the rest"
+    );
+}
+
 // ------------------------------------------------------- introspection --
 
 #[test]

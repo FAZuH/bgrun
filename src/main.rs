@@ -44,6 +44,8 @@ fn main() -> ExitCode {
             name,
             journalctl_opts,
         } => logs(&prefix, &name, &journalctl_opts),
+        Action::Stop(names) => stop(&prefix, &names),
+        Action::Resume(names) => resume(&prefix, &names),
         Action::Remove(names) => remove(&prefix, &names),
         Action::Clean => clean(&prefix),
     }
@@ -161,6 +163,38 @@ fn logs(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCo
             .arg(prefix.unit(name))
             .args(journalctl_opts),
     )
+}
+
+/// Stop units for now, leaving a persisted job's unit file alone so
+/// `resume` — or the next boot — brings it back. A transient job is
+/// collected the moment it goes inactive, so for one of those a stop is
+/// final and only `remove` is left to say.
+fn stop(prefix: &Prefix, names: &[JobName]) -> ExitCode {
+    for_each_unit(prefix, names, "stop", "stopped")
+}
+
+/// `systemctl start` for whatever `stop` left behind.
+fn resume(prefix: &Prefix, names: &[JobName]) -> ExitCode {
+    for_each_unit(prefix, names, "start", "resumed")
+}
+
+/// `systemctl --user <verb> <unit>` per name, one line of output per name
+/// that worked.
+fn for_each_unit(prefix: &Prefix, names: &[JobName], verb: &str, done: &str) -> ExitCode {
+    let mut all_ok = true;
+    for name in names {
+        let unit = prefix.unit(name);
+        let (_, ok) = systemctl_user(&[verb, &unit]);
+        if ok {
+            println!("{done}: {unit}");
+        }
+        all_ok &= ok;
+    }
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCodes::failure()
+    }
 }
 
 fn remove(prefix: &Prefix, names: &[JobName]) -> ExitCode {
@@ -292,8 +326,9 @@ Usage:
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
-  bgrun stop <name> [name...]                stop + forget units
-  bgrun remove <name> [name...]              alias of stop
+  bgrun stop <name> [name...]                stop for now
+  bgrun resume <name> [name...]              start a stopped job again
+  bgrun remove <name> [name...]              stop + forget, for good
   bgrun clean                                forget failed {prefix}-* units
 
 The command must come after '--'. The job name defaults to the command's
