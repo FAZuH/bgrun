@@ -62,6 +62,10 @@ bgrun add build -p WorkingDirectory=$HOME/project -- make
 bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 ```
 
+`-p` is systemd-run's `--property`, not a shorthand for bgrun's `--persist`
+(that is `-b`): a bare `-p` with no `KEY=VALUE` swallows the command's first
+word, so `bgrun -p -- make` tries to run nothing at all.
+
 `BGRUN_PREFIX` renames every unit at once (`bgrun-e2e-download` instead of
 `bgrun-dl`); useful when two projects would otherwise fight over a name.
 
