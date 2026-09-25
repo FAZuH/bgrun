@@ -41,11 +41,12 @@ bgrun add build -p WorkingDirectory=$HOME/project -- make
 bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
 ```
 
-`bgrun add` takes two flags of its own, between the name and the overrides:
+Two flags of bgrun's own work in either form, in front of the overrides:
 
 ```sh
-bgrun add api --restart -- ./server            # retry whenever it exits non-zero
-bgrun add sync --persist -- ./sync.sh ~/data   # also runs at every boot
+bgrun --restart -- ./server               # retry whenever it exits non-zero
+bgrun add api --persist -- ./server       # also runs at every boot
+bgrun --persist -- ./sync.sh ~/data       # name derived, no `add` needed
 ```
 
 Run `bgrun help` for the full command list.
@@ -63,7 +64,8 @@ Run `bgrun help` for the full command list.
   cannot be enabled, so bgrun writes a unit file under the systemd user unit
   directory (`~/.config/systemd/user`) and enables it. Only `-p KEY=VALUE`
   overrides can be written to a unit file. The job then starts at every boot,
-  which is exactly why `bgrun remove` is what deletes that file again.
+  which is exactly why `bgrun remove` is what deletes that file again. A name
+  already taken by a running transient job is refused: stop it first.
 - The unit prefix is `bgrun`, override with `BGRUN_PREFIX` (letters, digits,
   `-` and `_` only).
 

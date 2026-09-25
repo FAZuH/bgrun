@@ -242,8 +242,11 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
 
     match &*first {
         "help" | "-h" | "--help" => Ok(Action::Help),
-        "--" => run_spec(None, &[], rest).map(Action::Run),
         "add" => parse_add(rest),
+        // The bare form is `add` with the name left to be derived, so a
+        // leading option can only be one of ours or an override — never a
+        // mistyped subcommand.
+        _ if first.starts_with('-') => launch(None, args),
         "list" => expect_no_args("list", rest).map(|()| Action::List),
         "clean" => expect_no_args("clean", rest).map(|()| Action::Clean),
         "status" => match rest {
@@ -284,49 +287,67 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
 
 /// `add [NAME] [--restart] [--persist] [overrides] -- <command…>`
 fn parse_add(args: &[OsString]) -> Result<Action, ParseError> {
-    let mut name = None;
-    let mut start = 0;
-
     // Optional NAME: the first token, unless it looks like an option or is
     // the separator itself.
-    if let Some(first) = args
+    match args
         .first()
         .filter(|first| first.as_os_str() != "--" && !first.to_string_lossy().starts_with('-'))
     {
-        name = Some(JobName::parse(first));
-        start = 1;
+        Some(name) => launch(Some(JobName::parse(name)), &args[1..]),
+        None => launch(None, args),
     }
+}
 
-    // Overrides run verbatim up to the mandatory `--`, except for bgrun's
-    // own flags, which it consumes here.
-    let Some(offset) = args[start..].iter().position(|a| a.as_os_str() == "--") else {
+/// Both launch forms: bgrun's own flags, then a verbatim systemd-run
+/// override region, then the mandatory `--` and the command. `add` supplies
+/// a name; the bare form leaves it to be derived from the command.
+fn launch(name: Option<JobName>, args: &[OsString]) -> Result<Action, ParseError> {
+    let (flags, rest) = take_flags(args);
+    let Some(offset) = rest.iter().position(|arg| arg.as_os_str() == "--") else {
         return Err(ParseError::MissingSeparator);
     };
-    let sep = start + offset;
-    let command = &args[sep + 1..];
+    let mut spec = run_spec(name, &rest[..offset], &rest[offset + 1..])?;
+    flags.apply(&mut spec);
+    Ok(Action::Run(spec))
+}
 
-    let mut systemd_opts = Vec::new();
-    let mut persist = false;
-    let mut restart = false;
-    for arg in &args[start..sep] {
-        match arg.to_string_lossy().as_ref() {
-            "--restart" => restart = true,
-            "--persist" => persist = true,
-            _ => systemd_opts.push(arg.clone()),
+/// bgrun's own flags, which both launch forms accept in front of the `--`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Flags {
+    restart: bool,
+    persist: bool,
+}
+
+impl Flags {
+    /// Fold the flags into a spec. `--restart` becomes a systemd property,
+    /// placed ahead of the user's own because the last assignment wins: an
+    /// explicit `-p Restart=…` must still override it.
+    fn apply(self, spec: &mut RunSpec) {
+        spec.persist = self.persist;
+        if self.restart {
+            spec.systemd_opts.splice(
+                0..0,
+                [OsString::from("-p"), OsString::from("Restart=on-failure")],
+            );
         }
     }
-    if restart {
-        // Ahead of the user's own properties: for `systemd-run` the last
-        // assignment wins, so an explicit `-p Restart=…` still overrides.
-        systemd_opts.splice(
-            0..0,
-            [OsString::from("-p"), OsString::from("Restart=on-failure")],
-        );
-    }
+}
 
-    let mut spec = run_spec(name, &systemd_opts, command)?;
-    spec.persist = persist;
-    Ok(Action::Run(spec))
+/// Consume a leading run of bgrun's flags, returning them and everything
+/// after. Anything else is left for the caller: the start of an override
+/// region, or the `--` that ends one.
+fn take_flags(args: &[OsString]) -> (Flags, &[OsString]) {
+    let mut flags = Flags::default();
+    let mut rest = args;
+    while let Some((flag, tail)) = rest.split_first() {
+        match flag.to_string_lossy().as_ref() {
+            "--restart" => flags.restart = true,
+            "--persist" => flags.persist = true,
+            _ => break,
+        }
+        rest = tail;
+    }
+    (flags, rest)
 }
 
 /// Shared tail for the two launch forms (`-- cmd…` and `add … -- cmd…`).
@@ -637,6 +658,37 @@ mod tests {
         let spec = spec(&["add", "build", "--persist", "--", "make"]);
         assert!(spec.persist);
         assert!(spec.systemd_opts.is_empty());
+    }
+
+    #[test]
+    fn bare_run_takes_the_same_flags_as_add() {
+        let spec = spec(&["--restart", "--persist", "--", "make"]);
+        assert!(spec.persist);
+        assert_eq!(spec.systemd_opts, os(&["-p", "Restart=on-failure"]));
+        assert_eq!(spec.name, None);
+    }
+
+    #[test]
+    fn bare_run_forwards_overrides_too() {
+        let spec = spec(&["-p", "MemoryMax=1G", "--", "make"]);
+        assert_eq!(spec.systemd_opts, os(&["-p", "MemoryMax=1G"]));
+        assert!(!spec.persist);
+    }
+
+    #[test]
+    fn flags_after_the_separator_belong_to_the_command() {
+        let spec = spec(&["--persist", "--", "make", "--persist", "--restart"]);
+        assert!(spec.persist);
+        assert!(spec.systemd_opts.is_empty());
+        assert_eq!(spec.command, os(&["make", "--persist", "--restart"]));
+    }
+
+    #[test]
+    fn a_leading_option_is_never_mistaken_for_a_subcommand() {
+        // Forwarded to systemd-run, which rejects what it does not know.
+        let spec = spec(&["-x", "--", "make"]);
+        assert_eq!(spec.systemd_opts, os(&["-x"]));
+        assert_eq!(spec.command, os(&["make"]));
     }
 
     #[test]
