@@ -62,6 +62,14 @@ bgrun add build -- make -j8
 bgrun watch build               # streams output; exits 0, or the build's code
 ```
 
+Options after the name go to `journalctl`, the same as `bgrun logs` — so
+`-n 200` prints the tail of what already happened before the live output, which
+is what you want after restarting a long job:
+
+```sh
+bgrun watch build -n 200        # last 200 lines, then follow, then the result
+```
+
 Run `bgrun help` for the full command list.
 
 ## Notes

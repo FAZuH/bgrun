@@ -1260,12 +1260,109 @@ fn a_job_that_runs_longer_than_a_few_polls_is_still_waited_for() {
 }
 
 #[test]
-fn watch_takes_exactly_one_name() {
+fn watch_prints_the_catch_up_before_the_follow_and_the_result_last() {
     let sandbox = Sandbox::new();
-    let output = sandbox.run(&["watch", "a", "b"]);
+    // A follower that prints catch-up lines, then live ones, so the order on
+    // the terminal is observable rather than inferred.
+    sandbox.shim(
+        "journalctl",
+        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+         case \"$*\" in\n\
+         *SYSLOG_IDENTIFIER*) echo UNIT_RESULT=exit-code; echo EXIT_STATUS=3; exit 0;;\n\
+         esac\n\
+         echo 'catchup line 1'\n\
+         echo 'catchup line 2'\n\
+         echo 'live line'\n",
+    );
+    sandbox.running_then_ended("success", "0", true);
+
+    let output = sandbox.run(&["watch", "build", "-n", "200"]);
+
+    assert_eq!(
+        code(&output),
+        3,
+        "the result still prints: {}",
+        stdout(&output)
+    );
+    let out = stdout(&output);
+    let catchup = out
+        .find("catchup line 1")
+        .expect("catch-up must be printed");
+    let live = out.find("live line").expect("the follow must still stream");
+    let result = out
+        .find("bgrun-build.service:")
+        .expect("the result must print");
+    assert!(catchup < live, "catch-up before the follow: {out}");
+    assert!(live < result, "the result comes last: {out}");
+
+    // The options reach the follower, ahead of --follow.
+    assert!(
+        sandbox
+            .calls_containing("journalctl --user -u bgrun-build.service -n 200 --follow")
+            .len()
+            == 1,
+        "calls: {:?}",
+        sandbox.calls()
+    );
+}
+
+#[test]
+fn journalctl_options_reach_the_follower_and_never_the_outcome_query() {
+    let sandbox = Sandbox::new();
+    // A foreign `-u` and a `--since`: if either reached the query that reads
+    // the exit fields, `watch` would report some other unit's result.
+    sandbox.running_then_ended("success", "0", true);
+    let output = sandbox.run(&[
+        "watch",
+        "build",
+        "-u",
+        "some-other-unit",
+        "--since",
+        "last-week",
+    ]);
+
+    assert_eq!(
+        code(&output),
+        0,
+        "the outcome is this job's, not the foreign filter's: {}",
+        stdout(&output)
+    );
+    let query = sandbox
+        .calls_containing("SYSLOG_IDENTIFIER=systemd")
+        .into_iter()
+        .next()
+        .expect("a collected unit is read from the journal");
+    assert!(
+        !query.contains("some-other-unit"),
+        "a foreign -u must not reach the outcome query: {query}"
+    );
+    assert!(
+        !query.contains("last-week"),
+        "a --since must not reach the outcome query: {query}"
+    );
+    // The unit under watch is the one the follower was pointed at.
+    let follower = sandbox
+        .calls_containing("--follow")
+        .into_iter()
+        .next()
+        .expect("the follower must run");
+    assert!(
+        follower.contains("some-other-unit"),
+        "the follower is the user's: {follower}"
+    );
+    assert!(
+        follower.contains("bgrun-build.service"),
+        "the follower is this job's: {follower}"
+    );
+}
+
+#[test]
+fn watch_with_no_name_is_a_usage_error() {
+    let sandbox = Sandbox::new();
+    let output = sandbox.run(&["watch"]);
 
     assert_eq!(code(&output), 2);
-    assert!(stderr(&output).contains("unexpected extra arguments"));
+    assert!(stderr(&output).contains("missing job name"));
     assert!(
         sandbox.calls().is_empty(),
         "nothing may run: {:?}",
@@ -1409,6 +1506,8 @@ fn help_flag_exits_successfully() {
         "status",
         "logs",
         "watch",
+        // `watch` takes journalctl options after the name, as `logs` does.
+        "bgrun watch <name> [journalctl opts]",
         "stop",
         "resume",
         "remove",

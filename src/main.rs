@@ -48,7 +48,10 @@ fn main() -> ExitCode {
             name,
             journalctl_opts,
         } => logs(&prefix, &name, &journalctl_opts),
-        Action::Watch(name) => watch(&prefix, &name),
+        Action::Watch {
+            name,
+            journalctl_opts,
+        } => watch(&prefix, &name, &journalctl_opts),
         Action::Stop(names) => stop(&prefix, &names),
         Action::Resume(names) => resume(&prefix, &names),
         Action::Remove(names) => remove(&prefix, &names),
@@ -178,7 +181,7 @@ fn logs(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCo
 /// measured here at under 50 ms, never caught in a terminal state by a 7.8 ms
 /// poll — so a unit that is gone by the time we look has to be read from the
 /// exit record systemd left in the journal instead.
-fn watch(prefix: &Prefix, name: &JobName) -> ExitCode {
+fn watch(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCode {
     let unit = prefix.unit(name);
 
     let Some(state) = query_unit_state(&unit) else {
@@ -194,7 +197,10 @@ fn watch(prefix: &Prefix, name: &JobName) -> ExitCode {
         return ExitCodes::failure();
     }
 
-    let Some(follower) = Follower::start(&unit) else {
+    // The user's options go to the follower and nowhere else. The queries that
+    // decide the outcome build their own argv, so a `-u other-unit` or
+    // `--since` here cannot make `watch` report some other job's result.
+    let Some(follower) = Follower::start(&unit, journalctl_opts) else {
         return spawn_failed("journalctl", &std::io::Error::other("cannot follow"));
     };
 
@@ -282,11 +288,15 @@ fn not_a_job(unit: &str, name: &JobName) -> ExitCode {
 struct Follower(std::process::Child);
 
 impl Follower {
-    fn start(unit: &str) -> Option<Self> {
+    /// `journalctl --user -u <unit> [opts…] --follow`: the caller's options
+    /// come first so a catch-up like `-n 200` prints before the tail, and
+    /// `--follow` last so the argv reads in the order it is used.
+    fn start(unit: &str, journalctl_opts: &[OsString]) -> Option<Self> {
         Command::new("journalctl")
             .arg("--user")
             .arg("-u")
             .arg(unit)
+            .args(journalctl_opts)
             .arg("--follow")
             .spawn()
             .ok()
@@ -692,7 +702,7 @@ Usage:
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
-  bgrun watch <name>                         stream the job, then exit with its status
+  bgrun watch <name> [journalctl opts]      stream the job, then exit with its status
   bgrun stop <name> [name...]                stop for now (--persist only resumes)
   bgrun resume <name> [name...]              start a stopped --persist job again
   bgrun remove <name> [name...]              stop + forget, for good

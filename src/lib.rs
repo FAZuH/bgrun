@@ -174,8 +174,12 @@ pub enum Action {
         journalctl_opts: Vec<OsString>,
     },
     /// Follow a job's journal until the unit stops running, then report how
-    /// it ended and exit with its status.
-    Watch(JobName),
+    /// it ended and exit with its status. Options after the name are
+    /// journalctl's, same rule as `logs`, and reach the follower only.
+    Watch {
+        name: JobName,
+        journalctl_opts: Vec<OsString>,
+    },
     /// Stop units for now; `resume` starts them again. Only a persisted job
     /// survives a stop — a transient one is collected as it goes inactive.
     Stop(Vec<JobName>),
@@ -281,7 +285,17 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
         "list" => expect_no_args("list", rest).map(|()| Action::List),
         "clean" => expect_no_args("clean", rest).map(|()| Action::Clean),
         "status" => one_name("status", rest).map(Action::Status),
-        "watch" => one_name("watch", rest).map(Action::Watch),
+        "watch" => {
+            let Some(name) = rest.first() else {
+                return Err(ParseError::MissingArgument {
+                    action: first.to_string(),
+                });
+            };
+            Ok(Action::Watch {
+                name: JobName::parse(name),
+                journalctl_opts: rest[1..].to_vec(),
+            })
+        }
         "logs" => {
             let Some(name) = rest.first() else {
                 return Err(ParseError::MissingArgument {
@@ -1049,20 +1063,36 @@ mod tests {
     }
 
     #[test]
-    fn watch_takes_exactly_one_name() {
-        assert_eq!(parse(&os(&["watch", "web"])), Ok(Action::Watch(s("web"))));
+    fn watch_takes_one_name_and_forwards_journalctl_options() {
+        let action = parse(&os(&["watch", "web", "-n", "200"])).unwrap();
+        let Action::Watch {
+            name,
+            journalctl_opts,
+        } = action
+        else {
+            panic!("expected Watch");
+        };
+        assert_eq!(name, s("web"));
+        assert_eq!(journalctl_opts, os(&["-n", "200"]));
+
+        // No name at all is still a usage error: a follow-until-exit is one
+        // stream of output, so it needs one job. A second bare word cannot be
+        // called an error, because it is indistinguishable from an option —
+        // the same trade `logs` makes.
         assert_eq!(
             parse(&os(&["watch"])),
             Err(ParseError::MissingArgument {
                 action: "watch".into()
             })
         );
-        assert_eq!(
-            parse(&os(&["watch", "a", "b"])),
-            Err(ParseError::UnexpectedArgument {
-                action: "watch".into()
-            })
-        );
+        let action = parse(&os(&["watch", "web", "-n", "200", "--since", "1h"])).unwrap();
+        let Action::Watch {
+            journalctl_opts, ..
+        } = action
+        else {
+            panic!("expected Watch");
+        };
+        assert_eq!(journalctl_opts, os(&["-n", "200", "--since", "1h"]));
     }
 
     #[test]
