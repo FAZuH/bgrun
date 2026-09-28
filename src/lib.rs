@@ -173,6 +173,13 @@ pub enum Action {
         name: JobName,
         journalctl_opts: Vec<OsString>,
     },
+    /// Follow a job's journal until the unit stops running, then report how
+    /// it ended and exit with its status. Options after the name are
+    /// journalctl's, same rule as `logs`, and reach the follower only.
+    Watch {
+        name: JobName,
+        journalctl_opts: Vec<OsString>,
+    },
     /// Stop units for now; `resume` starts them again. Only a persisted job
     /// survives a stop — a transient one is collected as it goes inactive.
     Stop(Vec<JobName>),
@@ -277,15 +284,18 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
         _ if first.starts_with('-') => launch(None, args),
         "list" => expect_no_args("list", rest).map(|()| Action::List),
         "clean" => expect_no_args("clean", rest).map(|()| Action::Clean),
-        "status" => match rest {
-            [name] => Ok(Action::Status(JobName::parse(name))),
-            [] => Err(ParseError::MissingArgument {
-                action: first.to_string(),
-            }),
-            [..] => Err(ParseError::UnexpectedArgument {
-                action: first.to_string(),
-            }),
-        },
+        "status" => one_name("status", rest).map(Action::Status),
+        "watch" => {
+            let Some(name) = rest.first() else {
+                return Err(ParseError::MissingArgument {
+                    action: first.to_string(),
+                });
+            };
+            Ok(Action::Watch {
+                name: JobName::parse(name),
+                journalctl_opts: rest[1..].to_vec(),
+            })
+        }
         "logs" => {
             let Some(name) = rest.first() else {
                 return Err(ParseError::MissingArgument {
@@ -412,6 +422,19 @@ fn expect_no_args(action: &str, rest: &[OsString]) -> Result<(), ParseError> {
         Err(ParseError::UnexpectedArgument {
             action: action.to_owned(),
         })
+    }
+}
+
+/// Exactly one job name, as the subcommands that act on a single job need.
+fn one_name(action: &str, rest: &[OsString]) -> Result<JobName, ParseError> {
+    match rest {
+        [name] => Ok(JobName::parse(name)),
+        [] => Err(ParseError::MissingArgument {
+            action: action.to_owned(),
+        }),
+        [..] => Err(ParseError::UnexpectedArgument {
+            action: action.to_owned(),
+        }),
     }
 }
 
@@ -1037,6 +1060,39 @@ mod tests {
         };
         assert_eq!(name, s("web"));
         assert_eq!(journalctl_opts, os(&["-n", "50", "--follow"]));
+    }
+
+    #[test]
+    fn watch_takes_one_name_and_forwards_journalctl_options() {
+        let action = parse(&os(&["watch", "web", "-n", "200"])).unwrap();
+        let Action::Watch {
+            name,
+            journalctl_opts,
+        } = action
+        else {
+            panic!("expected Watch");
+        };
+        assert_eq!(name, s("web"));
+        assert_eq!(journalctl_opts, os(&["-n", "200"]));
+
+        // No name at all is still a usage error: a follow-until-exit is one
+        // stream of output, so it needs one job. A second bare word cannot be
+        // called an error, because it is indistinguishable from an option —
+        // the same trade `logs` makes.
+        assert_eq!(
+            parse(&os(&["watch"])),
+            Err(ParseError::MissingArgument {
+                action: "watch".into()
+            })
+        );
+        let action = parse(&os(&["watch", "web", "-n", "200", "--since", "1h"])).unwrap();
+        let Action::Watch {
+            journalctl_opts, ..
+        } = action
+        else {
+            panic!("expected Watch");
+        };
+        assert_eq!(journalctl_opts, os(&["-n", "200", "--since", "1h"]));
     }
 
     #[test]
