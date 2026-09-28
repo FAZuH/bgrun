@@ -22,6 +22,15 @@ Or download a prebuilt Linux binary from [Releases](https://github.com/FAZuH/bgr
 
 Requires a Linux system with systemd (user session, `systemd-run`, `journalctl`).
 
+### Agent skill
+
+[bgrun ships an agent skill](skills/bgrun/SKILL.md) so a coding assistant
+reaches for `bgrun` instead of a bare `&`:
+
+```sh
+npx skills add FAZuH/bgrun
+```
+
 ## Usage
 
 ```sh
@@ -33,41 +42,6 @@ bgrun watch dl                   # stream it, then exit with the job's status
 bgrun stop dl                    # stop for now, keep the job
 bgrun resume dl                  # start it again
 bgrun remove dl                  # stop and forget it for good
-```
-
-The command must come after `--`. The job name defaults to the command's
-basename. Everything between the name and `--` goes straight to `systemd-run`,
-so unit properties can be overridden:
-
-```sh
-bgrun add build -p WorkingDirectory=$HOME/project -- make
-bgrun add dl --working-directory=/tmp -pMemoryMax=1G -- wget URL
-```
-
-Two flags of bgrun's own work in either form, in front of the overrides:
-
-```sh
-bgrun --restart -- ./server               # or -r: retry whenever it exits non-zero
-bgrun add api --persist -- ./server       # or -b: also runs at every boot
-bgrun -b -- ./sync.sh ~/data              # name derived, no `add` needed
-```
-
-`bgrun watch` is both the tail and the wait: it streams the job's journal
-while it runs, reports how it ended the moment it stops, and exits with the
-job's own status — so `bgrun watch dl && next-step` works in a script without
-polling `bgrun status` in a loop.
-
-```sh
-bgrun add build -- make -j8
-bgrun watch build               # streams output; exits 0, or the build's code
-```
-
-Options after the name go to `journalctl`, the same as `bgrun logs` — so
-`-n 200` prints the tail of what already happened before the live output, which
-is what you want after restarting a long job:
-
-```sh
-bgrun watch build -n 200        # last 200 lines, then follow, then the result
 ```
 
 Run `bgrun help` for the full command list.
@@ -105,15 +79,6 @@ Run `bgrun help` for the full command list.
   command that is in nobody's `PATH` is refused instead of failing at boot.
 - The unit prefix is `bgrun`, override with `BGRUN_PREFIX` (letters, digits,
   `-` and `_` only).
-
-## Agent skill
-
-[bgrun ships an agent skill](skills/bgrun/SKILL.md) so a coding assistant
-reaches for `bgrun` instead of a bare `&`:
-
-```sh
-npx skills add FAZuH/bgrun
-```
 
 ## Docs
 
