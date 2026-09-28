@@ -1,3 +1,10 @@
+## [0.1.6](https://github.com/FAZuH/bgrun/compare/v0.1.5...v0.1.6) (2026-09-28)
+
+
+### Bug Fixes
+
+* **cli:** say a transient job cannot be resumed ([22bbd05](https://github.com/FAZuH/bgrun/commit/22bbd055f5473011a35fbb478e1e5de3628da960)), closes [#3](https://github.com/FAZuH/bgrun/issues/3) [#4](https://github.com/FAZuH/bgrun/issues/4)
+
 ## [0.1.5](https://github.com/FAZuH/bgrun/compare/v0.1.4...v0.1.5) (2026-09-25)
 
 
@@ -31,12 +38,4 @@
 ### Bug Fixes
 
 * **cli:** take the flags without add, and refuse to shadow a running job ([3e7734a](https://github.com/FAZuH/bgrun/commit/3e7734ae4b3b41da366da6bf861a9b6a2845d74e))
-
-## [0.1.1](https://github.com/FAZuH/bgrun/compare/v0.1.0...v0.1.1) (2026-09-25)
-
-
-### Features
-
-* **cli:** add --restart and --persist to bgrun add ([0c59d24](https://github.com/FAZuH/bgrun/commit/0c59d24a0c4f38c51970c822c465082bc3c6abfc))
-* **skill:** add bgrun agent skill for npx skills install ([4a2cedd](https://github.com/FAZuH/bgrun/commit/4a2cedd0a13c454d6bccce5dc6080010284bfb6e))
 
