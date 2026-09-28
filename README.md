@@ -29,6 +29,7 @@ bgrun -- make -j8                # run in background, name auto-derived ("make")
 bgrun add dl -- wget URL         # named job "dl"
 bgrun list                       # all bgrun-* units
 bgrun logs dl                    # journalctl for the job
+bgrun watch dl                   # stream it, then exit with the job's status
 bgrun stop dl                    # stop for now, keep the job
 bgrun resume dl                  # start it again
 bgrun remove dl                  # stop and forget it for good
@@ -49,6 +50,16 @@ Two flags of bgrun's own work in either form, in front of the overrides:
 bgrun --restart -- ./server               # or -r: retry whenever it exits non-zero
 bgrun add api --persist -- ./server       # or -b: also runs at every boot
 bgrun -b -- ./sync.sh ~/data              # name derived, no `add` needed
+```
+
+`bgrun watch` is both the tail and the wait: it streams the job's journal
+while it runs, reports how it ended the moment it stops, and exits with the
+job's own status — so `bgrun watch dl && next-step` works in a script without
+polling `bgrun status` in a loop.
+
+```sh
+bgrun add build -- make -j8
+bgrun watch build               # streams output; exits 0, or the build's code
 ```
 
 Run `bgrun help` for the full command list.

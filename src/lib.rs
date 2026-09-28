@@ -173,6 +173,9 @@ pub enum Action {
         name: JobName,
         journalctl_opts: Vec<OsString>,
     },
+    /// Follow a job's journal until the unit stops running, then report how
+    /// it ended and exit with its status.
+    Watch(JobName),
     /// Stop units for now; `resume` starts them again. Only a persisted job
     /// survives a stop — a transient one is collected as it goes inactive.
     Stop(Vec<JobName>),
@@ -277,15 +280,8 @@ pub fn parse(args: &[OsString]) -> Result<Action, ParseError> {
         _ if first.starts_with('-') => launch(None, args),
         "list" => expect_no_args("list", rest).map(|()| Action::List),
         "clean" => expect_no_args("clean", rest).map(|()| Action::Clean),
-        "status" => match rest {
-            [name] => Ok(Action::Status(JobName::parse(name))),
-            [] => Err(ParseError::MissingArgument {
-                action: first.to_string(),
-            }),
-            [..] => Err(ParseError::UnexpectedArgument {
-                action: first.to_string(),
-            }),
-        },
+        "status" => one_name("status", rest).map(Action::Status),
+        "watch" => one_name("watch", rest).map(Action::Watch),
         "logs" => {
             let Some(name) = rest.first() else {
                 return Err(ParseError::MissingArgument {
@@ -412,6 +408,19 @@ fn expect_no_args(action: &str, rest: &[OsString]) -> Result<(), ParseError> {
         Err(ParseError::UnexpectedArgument {
             action: action.to_owned(),
         })
+    }
+}
+
+/// Exactly one job name, as the subcommands that act on a single job need.
+fn one_name(action: &str, rest: &[OsString]) -> Result<JobName, ParseError> {
+    match rest {
+        [name] => Ok(JobName::parse(name)),
+        [] => Err(ParseError::MissingArgument {
+            action: action.to_owned(),
+        }),
+        [..] => Err(ParseError::UnexpectedArgument {
+            action: action.to_owned(),
+        }),
     }
 }
 
@@ -1037,6 +1046,23 @@ mod tests {
         };
         assert_eq!(name, s("web"));
         assert_eq!(journalctl_opts, os(&["-n", "50", "--follow"]));
+    }
+
+    #[test]
+    fn watch_takes_exactly_one_name() {
+        assert_eq!(parse(&os(&["watch", "web"])), Ok(Action::Watch(s("web"))));
+        assert_eq!(
+            parse(&os(&["watch"])),
+            Err(ParseError::MissingArgument {
+                action: "watch".into()
+            })
+        );
+        assert_eq!(
+            parse(&os(&["watch", "a", "b"])),
+            Err(ParseError::UnexpectedArgument {
+                action: "watch".into()
+            })
+        );
     }
 
     #[test]

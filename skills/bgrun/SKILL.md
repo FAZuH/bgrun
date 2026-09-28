@@ -34,6 +34,7 @@ bgrun -- make -j8     # correct
 | `bgrun list` | every `bgrun-*` unit, running or failed |
 | `bgrun status <name>` | systemd status for one job |
 | `bgrun logs <name> [journalctl opts]` | its journal, e.g. `--follow`, `-n 200` |
+| `bgrun watch <name>` | stream its journal until it ends, then exit with its status |
 | `bgrun stop <name>...` | stop for now, keeping the job |
 | `bgrun resume <name>...` | start a stopped job again |
 | `bgrun remove <name>...` | stop and forget for good |
@@ -115,6 +116,21 @@ user a `stop`/`resume` cycle for a job launched without `-b`.
 is doing what you wanted. For anything long enough to matter, follow up with
 `bgrun status <name>`, or `bgrun logs <name> -n 50` once, before you report
 the job as running.
+
+**To wait for a job, use `bgrun watch <name>` — never a `bgrun status` polling
+loop.** It streams the journal as the job writes it, prints how the job ended
+the moment it stops, and exits with the job's own status, so one command is
+both the tail and the wait:
+
+```sh
+bgrun add build -- make -j8
+bgrun watch build     # exit 0, or the build's exit code, or 128+signal
+```
+
+Use the exit code directly — `bgrun watch build || echo "build failed"` — and
+report the real code rather than assuming success. For a long-lived job
+(server, daemon) there is nothing to wait for: check it once with
+`bgrun status` and move on.
 
 Clean up when the job is done: `bgrun remove <name>`. Successful transient
 jobs delete themselves, but a failed one lingers as a `failed` unit until
