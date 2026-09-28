@@ -255,6 +255,25 @@ impl Sandbox {
         pidfile
     }
 
+    /// A `systemctl` where every verb fails because the unit is gone, and a
+    /// `LoadState` query agrees: what `stop`/`resume` see on a collected
+    /// transient job.
+    fn unit_gone(&self) {
+        self.shim(
+            "systemctl",
+            "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *LoadState*) echo not-found; exit 0;; esac\necho 'Failed: Unit not loaded.' >&2\nexit 5\n",
+        );
+    }
+
+    /// A `systemctl` that fails for a reason other than a missing unit, so
+    /// the re-add hint must stay out of the way.
+    fn systemctl_denied(&self) {
+        self.shim(
+            "systemctl",
+            "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *LoadState*) echo loaded; exit 0;; esac\necho 'Access denied' >&2\nexit 1\n",
+        );
+    }
+
     /// Make `loginctl` report that lingering is off.
     fn linger_disabled(&self) {
         self.shim(
@@ -696,6 +715,88 @@ fn a_stop_systemd_refuses_is_reported_as_a_failure() {
     assert!(
         stdout(&output).contains("stopped: bgrun-b.service"),
         "one bad name must not skip the rest"
+    );
+}
+
+#[test]
+fn a_stop_of_a_collected_unit_says_to_re_add_it() {
+    let sandbox = Sandbox::new();
+    sandbox.unit_gone();
+
+    let output = sandbox.run(&["stop", "dl"]);
+
+    assert_eq!(code(&output), 1);
+    let err = stderr(&output);
+    assert!(
+        err.contains("only a --persist job survives a stop"),
+        "the re-add rule is missing:\n{err}"
+    );
+    assert!(
+        err.contains("bgrun add dl -- <cmd>"),
+        "the hint must name the re-add:\n{err}"
+    );
+}
+
+#[test]
+fn a_resume_of_a_collected_unit_says_to_re_add_it() {
+    let sandbox = Sandbox::new();
+    sandbox.unit_gone();
+
+    let output = sandbox.run(&["resume", "dl"]);
+
+    assert_eq!(code(&output), 1);
+    let err = stderr(&output);
+    assert!(
+        err.contains("only a --persist job survives a stop"),
+        "the re-add rule is missing:\n{err}"
+    );
+    assert!(
+        err.contains("bgrun add dl -- <cmd>"),
+        "the hint must name the re-add:\n{err}"
+    );
+}
+
+#[test]
+fn a_gone_unit_does_not_stop_the_names_after_it() {
+    let sandbox = Sandbox::new();
+    sandbox.shim(
+        "systemctl",
+        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+         case \"$*\" in *LoadState*) echo not-found; exit 0;; *bgrun-a.service) echo 'not loaded' >&2; exit 5;; esac\n\
+         exit 0\n",
+    );
+
+    let output = sandbox.run(&["stop", "a", "b"]);
+
+    assert_eq!(code(&output), 1);
+    assert!(
+        stderr(&output).contains("bgrun add a -- <cmd>"),
+        "the gone name is explained: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("stopped: bgrun-b.service"),
+        "one gone name must not skip the rest: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn a_failure_that_is_not_a_missing_unit_is_left_alone() {
+    let sandbox = Sandbox::new();
+    sandbox.systemctl_denied();
+
+    let output = sandbox.run(&["resume", "api"]);
+
+    assert_eq!(code(&output), 1);
+    let err = stderr(&output);
+    assert!(
+        err.contains("Access denied"),
+        "systemd reports itself: {err}"
+    );
+    assert!(
+        !err.contains("--persist"),
+        "the re-add hint is only for a missing unit: {err}"
     );
 }
 
@@ -1314,6 +1415,8 @@ fn help_flag_exits_successfully() {
         "clean",
         "--restart",
         "--persist",
+        // The help must not imply a transient job can be resumed (#4).
+        "--persist only resumes",
     ] {
         assert!(out.contains(expected), "help omits {expected}:\n{out}");
     }
