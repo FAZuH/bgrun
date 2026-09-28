@@ -48,6 +48,10 @@ fn main() -> ExitCode {
             name,
             journalctl_opts,
         } => logs(&prefix, &name, &journalctl_opts),
+        Action::Watch {
+            name,
+            journalctl_opts,
+        } => watch(&prefix, &name, &journalctl_opts),
         Action::Stop(names) => stop(&prefix, &names),
         Action::Resume(names) => resume(&prefix, &names),
         Action::Remove(names) => remove(&prefix, &names),
@@ -167,6 +171,357 @@ fn logs(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCo
             .arg(prefix.unit(name))
             .args(journalctl_opts),
     )
+}
+
+/// Follow a job's journal until the unit stops running, report how it ended,
+/// and exit with its status.
+///
+/// The outcome comes from systemd's own record of the exit, never from the
+/// job's output. A `--collect` unit is unloaded the moment it goes inactive —
+/// measured here at under 50 ms, never caught in a terminal state by a 7.8 ms
+/// poll — so a unit that is gone by the time we look has to be read from the
+/// exit record systemd left in the journal instead.
+fn watch(prefix: &Prefix, name: &JobName, journalctl_opts: &[OsString]) -> ExitCode {
+    let unit = prefix.unit(name);
+
+    let Some(state) = query_unit_state(&unit) else {
+        eprintln!("error: cannot query {unit}: systemctl is not answering");
+        return ExitCodes::failure();
+    };
+    if state.load == "not-found" {
+        return not_a_job(&unit, name);
+    }
+    if !still_running(&state.active) {
+        eprintln!("error: {unit} is not running ({})", state.active);
+        eprintln!("  bgrun resume {name}   start a stopped job again");
+        return ExitCodes::failure();
+    }
+
+    // The user's options go to the follower and nowhere else. The queries that
+    // decide the outcome build their own argv, so a `-u other-unit` or
+    // `--since` here cannot make `watch` report some other job's result.
+    let Some(follower) = Follower::start(&unit, journalctl_opts) else {
+        return spawn_failed("journalctl", &std::io::Error::other("cannot follow"));
+    };
+
+    // ponytail: `systemctl wait` is not in systemd 261, so this is a poll.
+    // Costs one fork per tick and up to one tick of latency after the job
+    // stops; a `wait` verb would replace the whole loop.
+    let ended = match wait_until_ended(&unit) {
+        Ok(ended) => ended,
+        Err(code) => {
+            drop(follower);
+            return code;
+        }
+    };
+    drop(follower);
+
+    let outcome = outcome(&unit, &ended);
+    println!("{unit}: {}", outcome.detail);
+    outcome.code
+}
+
+/// Poll until the unit leaves the running states, returning the last state
+/// seen — including the one that ended the wait, so the caller does not have
+/// to ask again.
+///
+/// A `systemctl` that fails is not an answer about the job. Treating it as one
+/// would report a result for a job that is still running, so a failure only
+/// ends the wait after a run of consecutive failures; a job that simply takes
+/// a long time is waited out for as long as it takes.
+fn wait_until_ended(unit: &str) -> Result<UnitState, ExitCode> {
+    const PATIENCE: usize = 5;
+    let mut failures = 0;
+    loop {
+        match query_unit_state(unit) {
+            Some(state) => {
+                failures = 0;
+                if !still_running(&state.active) {
+                    return Ok(state);
+                }
+            }
+            None => {
+                failures += 1;
+                if failures >= PATIENCE {
+                    eprintln!("error: lost contact with systemd while waiting for {unit}");
+                    return Err(ExitCodes::failure());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// A unit the manager no longer knows, or one it collected. A transient job
+/// that already finished is the second case, and its journal is still there.
+fn not_a_job(unit: &str, name: &JobName) -> ExitCode {
+    match journal_has_records(unit) {
+        Some(true) => {
+            eprintln!("error: {unit} has already finished and was collected");
+            eprintln!("  its journal is still readable: bgrun logs {name}");
+        }
+        Some(false) => {
+            eprintln!("error: no such job: {unit}");
+            eprintln!("  bgrun list              what bgrun is running");
+        }
+        // A journal that cannot answer has proved nothing either way, so
+        // claiming the name was never used would be a guess.
+        None => {
+            eprintln!("error: cannot read the journal, so cannot tell whether {unit} ran");
+            eprintln!("  bgrun list              what bgrun is running");
+        }
+    }
+    ExitCodes::failure()
+}
+
+/// The `journalctl --user -u <unit> -f` child, killed and reaped on drop so
+/// no follower outlives the command. It stays in bgrun's own process group on
+/// purpose: a terminal Ctrl-C signals the whole foreground group, so the
+/// interrupt takes the follower down with us instead of orphaning a `-f` that
+/// would stream forever.
+///
+/// ponytail: a signal aimed at bgrun alone (`kill -INT <pid>`, an agent
+/// harness) still leaves the follower, because catching it needs a handler
+/// and this crate forbids both `unsafe` and new dependencies. Take the
+/// follower down by signalling the group, or add `signal-hook` if a
+/// single-target interrupt has to be survivable.
+struct Follower(std::process::Child);
+
+impl Follower {
+    /// `journalctl --user -u <unit> [opts…] --follow`: the caller's options
+    /// come first so a catch-up like `-n 200` prints before the tail, and
+    /// `--follow` last so the argv reads in the order it is used.
+    fn start(unit: &str, journalctl_opts: &[OsString]) -> Option<Self> {
+        Command::new("journalctl")
+            .arg("--user")
+            .arg("-u")
+            .arg(unit)
+            .args(journalctl_opts)
+            .arg("--follow")
+            .spawn()
+            .ok()
+            .map(Self)
+    }
+
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The unit states in which a job is still going. `deactivating` counts: the
+/// unit is on its way out, and its result is not final until it lands.
+fn still_running(active: &str) -> bool {
+    matches!(
+        active,
+        "active" | "activating" | "reloading" | "deactivating"
+    )
+}
+
+struct UnitState {
+    load: String,
+    active: String,
+}
+
+/// How a job ended, and the exit code `bgrun watch` reports for it.
+struct Outcome {
+    detail: String,
+    code: ExitCode,
+}
+
+/// `systemctl --user show <unit> -p LoadState -p ActiveState --value`.
+///
+/// A unit the manager has never heard of still answers, as `not-found`, so
+/// this is only `None` when systemctl itself could not be run or refused.
+fn query_unit_state(unit: &str) -> Option<UnitState> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "-p",
+            "LoadState",
+            "-p",
+            "ActiveState",
+            "--value",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    Some(UnitState {
+        load: lines.next().unwrap_or_default().to_owned(),
+        active: lines.next().unwrap_or_default().to_owned(),
+    })
+}
+
+/// systemd's record of the exit: off the unit while it is still loaded, and
+/// off the journal's exit fields once a collected unit is gone. A clean exit
+/// has no exit record at all, which is what `success` looks like in both.
+fn outcome(unit: &str, ended: &UnitState) -> Outcome {
+    if ended.load != "not-found"
+        && let Some(result) = unit_result(unit)
+    {
+        return result;
+    }
+    journal_result(unit)
+}
+
+fn unit_result(unit: &str) -> Option<Outcome> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "-p",
+            "Result",
+            "-p",
+            "ExecMainStatus",
+            "--value",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let result = lines.next()?.to_owned();
+    let status = lines.next().and_then(|line| line.trim().parse().ok());
+    Some(classify(&result, status))
+}
+
+/// systemd's `MESSAGE_ID` for "Started <unit>." — the record that opens a
+/// run. Everything after it belongs to an older run of the same name, and a
+/// name that has run before is the normal case, not an edge one.
+///
+/// These are systemd's own catalogue IDs, stable across versions, which is
+/// what makes it safe to hardcode rather than match on message text. If a
+/// systemd ever stopped emitting this one, the scan would fall through to the
+/// whole window and could report an older run's failure for a job that has
+/// since succeeded — wrong, but in the loud direction rather than a silent
+/// success.
+const STARTED_RECORD: &str = "MESSAGE_ID=39f53479d3a045ac8e11786248231fbf";
+
+/// The exit fields systemd logged for the run that just ended.
+///
+/// A unit's journal holds every run of that name, so this reads newest-first
+/// and stops at the record that opened the run we waited for: an earlier
+/// failure must not be reported for a job that has since succeeded. A clean
+/// exit writes no exit fields at all, so finding none within the run is what
+/// success looks like.
+///
+/// The two fields live on different records — `EXIT_STATUS` on "Main process
+/// exited, code=…, status=…/…", `UNIT_RESULT` on "Failed with result '…'" —
+/// so they are gathered independently and a short bound would drop one.
+fn journal_result(unit: &str) -> Outcome {
+    let unreadable = Outcome {
+        detail: "could not read the job's exit from the journal".to_owned(),
+        code: ExitCodes::failure(),
+    };
+    let Ok(output) = Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            unit,
+            "SYSLOG_IDENTIFIER=systemd",
+            "-r",
+            "-n",
+            "20",
+            "-o",
+            "export",
+            "--no-pager",
+        ])
+        .output()
+    else {
+        return unreadable;
+    };
+    if !output.status.success() {
+        return unreadable;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (result, status) = exit_fields(&text);
+    classify(&result, status)
+}
+
+/// The `UNIT_RESULT` and `EXIT_STATUS` of the newest run, as `(String,
+/// Option<i32>)`. Parsing stays defensive: the filter is a cost measure, not a
+/// trust boundary, so a job can put records of its own under that identifier.
+fn exit_fields(journal: &str) -> (String, Option<i32>) {
+    let mut result = String::new();
+    let mut status = None;
+    for line in journal.lines() {
+        if line == STARTED_RECORD {
+            break;
+        }
+        if result.is_empty()
+            && let Some(value) = line.strip_prefix("UNIT_RESULT=")
+        {
+            result = value.to_owned();
+        }
+        if status.is_none()
+            && let Some(value) = line.strip_prefix("EXIT_STATUS=")
+        {
+            status = value.trim().parse().ok();
+        }
+    }
+    (result, status)
+}
+
+/// The exit code a job's systemd result maps to: its own status for a plain
+/// exit, 128 + signal when a signal ended it, and a failure for any other
+/// result (timeout, watchdog, resources) that carries no status of its own.
+fn classify(result: &str, status: Option<i32>) -> Outcome {
+    let coded = |code: u8, detail: String| Outcome {
+        detail,
+        code: ExitCode::from(code),
+    };
+    match (result, status) {
+        ("exit-code", Some(status)) => coded(
+            u8::try_from(status).unwrap_or(bgrun::EXIT_FAILURE),
+            format!("exit code {status}"),
+        ),
+        ("signal" | "core-dump", Some(signal)) => {
+            // A signal number a shell could not have raised, from a journal
+            // field, so it is bounded rather than trusted into 128+.
+            let code = (1..=64).contains(&signal).then(|| 128 + signal);
+            match code.and_then(|sum| u8::try_from(sum).ok()) {
+                Some(code) => coded(code, format!("killed by signal {signal}")),
+                None => Outcome {
+                    detail: format!("ended with result '{result}' and status {signal}"),
+                    code: ExitCodes::failure(),
+                },
+            }
+        }
+        ("", _) | ("success", _) => Outcome {
+            detail: "finished successfully".to_owned(),
+            code: ExitCode::SUCCESS,
+        },
+        other => Outcome {
+            detail: format!("ended with result '{}'", other.0),
+            code: ExitCodes::failure(),
+        },
+    }
+}
+
+/// Whether anything at all was ever logged for a unit, which is what tells a
+/// collected job apart from a name that was never used. `None` means
+/// journalctl could not answer, which is not evidence that nothing ran.
+fn journal_has_records(unit: &str) -> Option<bool> {
+    let output = Command::new("journalctl")
+        .args(["--user", "-u", unit, "-n", "1", "--no-pager", "-q"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
 }
 
 /// Stop units for now, leaving a persisted job's unit file alone so
@@ -347,6 +702,7 @@ Usage:
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
+  bgrun watch <name> [journalctl opts]      stream the job, then exit with its status
   bgrun stop <name> [name...]                stop for now (--persist only resumes)
   bgrun resume <name> [name...]              start a stopped --persist job again
   bgrun remove <name> [name...]              stop + forget, for good
