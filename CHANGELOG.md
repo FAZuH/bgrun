@@ -1,3 +1,10 @@
+## [0.2.1](https://github.com/FAZuH/bgrun/compare/v0.2.0...v0.2.1) (2026-09-28)
+
+
+### Features
+
+* **cli:** let stop and resume work on a transient job ([b8b6bc2](https://github.com/FAZuH/bgrun/commit/b8b6bc253c788175182b33c0217e4e3a847895bb))
+
 ## [0.2.0](https://github.com/FAZuH/bgrun/compare/v0.1.6...v0.2.0) (2026-09-28)
 
 
@@ -31,12 +38,4 @@
 ### Bug Fixes
 
 * **cli:** reject a -p with no property value ([b640b23](https://github.com/FAZuH/bgrun/commit/b640b235b271342161fac7c7b16334e6ead87625))
-
-## [0.1.3](https://github.com/FAZuH/bgrun/compare/v0.1.2...v0.1.3) (2026-09-25)
-
-
-### Features
-
-* **cli:** a stop that can be undone, with resume ([149f6ff](https://github.com/FAZuH/bgrun/commit/149f6ffa46a006af07f252277bda8af9c33cf539))
-* **cli:** short forms for --restart and --persist ([2fa86dd](https://github.com/FAZuH/bgrun/commit/2fa86ddcd429f30a628eb27ad790afcfddb6a374))
 
