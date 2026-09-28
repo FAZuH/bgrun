@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
@@ -255,13 +256,84 @@ impl Sandbox {
         pidfile
     }
 
+    /// Make `systemctl show -p FragmentPath` report `path`, which is how bgrun
+    /// learns where a unit's definition lives — and so whether the unit is
+    /// transient at all.
+    fn fragment_path(&self, path: &Path) {
+        self.shim(
+            "systemctl",
+            &format!(
+                "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *FragmentPath*) echo {path}; exit 0;; esac\n",
+                path = path.display()
+            ),
+        );
+    }
+
+    /// The sandbox's stand-in for systemd's runtime directory, where a loaded
+    /// transient unit's definition lives. It lives inside the sandbox, so an
+    /// implementation that hardcoded `$XDG_RUNTIME_DIR` instead of asking
+    /// systemd finds nothing and fails.
+    fn runtime_dir(&self) -> PathBuf {
+        self.root.join("run").join("systemd").join("transient")
+    }
+
+    /// Answer `show -p FragmentPath` the way systemd does: a path in the runtime
+    /// directory for each named unit, nothing for every other name. Whether the
+    /// file is really there is a separate matter — a unit can be reported as
+    /// transient and have nothing to copy — so this is the answer, not a probe.
+    fn fragment_paths(&self, units: &[&str]) -> String {
+        let answers: String = units
+            .iter()
+            .map(|unit| {
+                format!(
+                    "  case \"$*\" in *' {unit} '*) echo {dir}/{unit};; esac\n",
+                    dir = self.runtime_dir().display()
+                )
+            })
+            .collect();
+        format!(
+            "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+             case \"$*\" in *FragmentPath*)\n{answers}exit 0;; esac\n"
+        )
+    }
+
+    /// A transient unit systemd is still holding: its own definition, argv
+    /// included, in the runtime directory that `systemctl show` then reports.
+    fn transient_unit(&self, unit: &str, body: &str) -> PathBuf {
+        let path = self.runtime_dir().join(unit);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        self.shim("systemctl", &self.fragment_paths(&[unit]));
+        path
+    }
+
+    /// The same, but with the stop refused for one unit: a `stop` that fails
+    /// after a definition was saved, which is the case a saved definition must
+    /// not survive.
+    fn stop_refused_for(&self, unit: &str, message: &str) {
+        self.shim(
+            "systemctl",
+            &format!(
+                "{log}case \" $* \" in *' stop {unit} '*) echo '{message}' >&2; exit 1;; esac\n",
+                log = self.fragment_paths(&[unit]),
+                unit = unit
+            ),
+        );
+    }
+
     /// A `systemctl` where every verb fails because the unit is gone, and a
     /// `LoadState` query agrees: what `stop`/`resume` see on a collected
-    /// transient job.
+    /// transient job. `FragmentPath` answers with nothing, as it does for a
+    /// unit the manager has never heard of.
     fn unit_gone(&self) {
         self.shim(
             "systemctl",
-            "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *LoadState*) echo not-found; exit 0;; esac\necho 'Failed: Unit not loaded.' >&2\nexit 5\n",
+            "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+             case \"$*\" in\n\
+             *LoadState*) echo not-found; exit 0;;\n\
+             *FragmentPath*) exit 0;;\n\
+             esac\n\
+             echo 'Failed: Unit not loaded.' >&2\nexit 5\n",
         );
     }
 
@@ -666,23 +738,53 @@ fn remove_says_nothing_about_transient_jobs() {
     );
 }
 
+/// The definition systemd writes for a transient unit while the unit is
+/// loaded — the bytes `bgrun stop` has to save, argv included, because they
+/// are the only record of how the job is run.
+const TRANSIENT_UNIT: &str = "\
+[Unit]
+Description=[systemd-run] /usr/bin/sleep 300
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=
+ExecStart=\"/usr/bin/sleep\" \"300\"
+";
+
 #[test]
 fn stop_keeps_the_job_and_resume_starts_it_again() {
     let sandbox = Sandbox::new();
     sandbox.write_unit_file("bgrun-build.service");
+    // A persisted job's definition is the file bgrun wrote, so there is
+    // nothing to save and nothing to add.
+    sandbox.fragment_path(&sandbox.unit_file("bgrun-build.service"));
 
     let output = sandbox.run(&["stop", "build"]);
 
     assert_eq!(code(&output), 0);
     assert!(stdout(&output).contains("stopped: bgrun-build.service"));
     assert!(
+        !stdout(&output).contains("bgrun resume build"),
+        "a persisted job needs no reminder: {}",
+        stdout(&output)
+    );
+    assert!(
         sandbox.unit_file("bgrun-build.service").exists(),
         "stop must not forget a persisted job"
     );
     let calls = sandbox.calls();
-    assert_eq!(calls.len(), 1, "stop is one systemctl call: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        2,
+        "stop asks where the definition is, then stops: {calls:?}"
+    );
     assert!(
-        calls[0].ends_with("systemctl --user stop bgrun-build.service"),
+        calls[0]
+            .ends_with("systemctl --user show bgrun-build.service --property=FragmentPath --value"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[1].ends_with("systemctl --user stop bgrun-build.service"),
         "{calls:?}"
     );
 
@@ -699,13 +801,297 @@ fn stop_keeps_the_job_and_resume_starts_it_again() {
 }
 
 #[test]
-fn a_stop_systemd_refuses_is_reported_as_a_failure() {
+fn stop_saves_a_transient_definition_so_resume_finds_a_unit_to_start() {
     let sandbox = Sandbox::new();
-    // One named unit fails; the loop must still reach the next name.
+    let source = sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+
+    let output = sandbox.run(&["stop", "dl"]);
+
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("stopped: bgrun-dl.service"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("bgrun resume dl"),
+        "a paused job says how to bring it back: {}",
+        stdout(&output)
+    );
+    // Verbatim: a rewritten file would be a second source of truth about how
+    // to run the job, and dropping `CollectMode` or adding an `[Install]`
+    // section would change what the job is.
+    let saved = fs::read_to_string(sandbox.unit_file("bgrun-dl.service"))
+        .expect("the definition was saved before the stop");
+    assert_eq!(saved, TRANSIENT_UNIT);
+    assert_eq!(saved, fs::read_to_string(&source).unwrap());
+
+    // Copy first, stop second: the definition is collected with the unit.
+    let calls = sandbox.calls();
+    let position = |needle: &str| {
+        calls
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing call containing {needle:?} in {calls:?}"))
+    };
+    assert!(
+        position("FragmentPath") < position("systemctl --user stop bgrun-dl.service"),
+        "the save must come before the stop that loses it: {calls:?}"
+    );
+
+    let output = sandbox.run(&["resume", "dl"]);
+
+    assert_eq!(code(&output), 0, "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("resumed: bgrun-dl.service"));
+    assert_eq!(
+        sandbox
+            .calls_containing("systemctl --user start bgrun-dl.service")
+            .len(),
+        1
+    );
+}
+
+/// A copy that dies part way through — here a write past `RLIMIT_FSIZE` —
+/// must not leave half a definition in the unit directory, where `resume`
+/// would start a job from a truncated file. The refusal claims nothing was
+/// saved, so a short file next to that claim is the worst possible outcome.
+#[test]
+fn a_copy_that_dies_part_way_leaves_nothing_behind() {
+    let sandbox = Sandbox::new();
+    // Comfortably larger than the 512-byte cap below, so the write is cut off
+    // mid-transfer rather than refused up front.
+    let body = format!("{TRANSIENT_UNIT}{}", "# padding\n".repeat(200));
+    assert!(body.len() > 1024, "the body must exceed the cap");
+    sandbox.transient_unit("bgrun-dl.service", &body);
+
+    // `ulimit -f` is in 512-byte blocks, so 1 caps any file at 512 bytes: a
+    // short write, the same shape as a full disk. The cap is set through a
+    // shell because the limit is inherited rather than a flag bgrun takes, and
+    // `SIGXFSZ` is ignored there because its default action kills the process —
+    // a signal death is not the refusal path under test, and bgrun cannot clean
+    // up after one. Ignoring it makes the failing `write` return an error, so
+    // the copy fails the way a full disk makes it fail.
+    let capped = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "trap '' XFSZ; ulimit -f 1; exec {binary} stop dl",
+            binary = env!("CARGO_BIN_EXE_bgrun")
+        ))
+        .env("PATH", sandbox.root.join("bin"))
+        .env("BGRUN_TEST_LOG", &sandbox.log)
+        .env_remove("BGRUN_PREFIX")
+        .env("XDG_CONFIG_HOME", &sandbox.root)
+        .env("USER", "tester")
+        .output()
+        .expect("failed to run bgrun");
+
+    assert_ne!(capped.status.code(), Some(0), "the capped copy must fail");
+    let left: Vec<String> = fs::read_dir(sandbox.root.join("systemd").join("user"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "a failed copy must leave the unit directory empty, not a partial \
+         definition and not a staging file: {left:?}"
+    );
+    assert!(
+        sandbox
+            .calls_containing("systemctl --user stop bgrun-dl.service")
+            .is_empty(),
+        "nothing may be stopped on a definition bgrun could not save: {:?}",
+        sandbox.calls()
+    );
+}
+
+#[test]
+fn a_transient_job_whose_definition_cannot_be_saved_is_not_stopped() {
+    let sandbox = Sandbox::new();
+    // systemd still reports the unit as transient, but there is nothing left
+    // to copy: stopping the job now would make it unresumable for good.
+    sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+    // The definition is gone while systemd still reports the unit as transient.
+    fs::remove_file(sandbox.runtime_dir().join("bgrun-dl.service")).unwrap();
+
+    let output = sandbox.run(&["stop", "dl"]);
+
+    assert_eq!(code(&output), 1);
+    let err = stderr(&output);
+    assert!(
+        err.contains("cannot save bgrun-dl.service for resume"),
+        "stderr: {err}"
+    );
+    assert!(err.contains("refusing to stop"), "stderr: {err}");
+    assert!(
+        sandbox
+            .calls_containing("systemctl --user stop bgrun-dl.service")
+            .is_empty(),
+        "a job whose definition the stop would destroy must keep running: {:?}",
+        sandbox.calls()
+    );
+    assert!(!sandbox.unit_file("bgrun-dl.service").exists());
+}
+
+#[test]
+fn a_paused_restart_job_resumes_with_the_policy_it_launched_with() {
+    // `-r` is `Restart=on-failure`, and systemd writes it into the transient
+    // definition, so a paused job must come back as a retrying one rather than
+    // a plain one-shot.
+    let body = "\
+[Unit]
+Description=[systemd-run] /usr/bin/sleep 300
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=
+ExecStart=\"/usr/bin/sleep\" \"300\"
+Restart=on-failure
+";
+    let sandbox = Sandbox::new();
+    sandbox.transient_unit("bgrun-web.service", body);
+
+    // The launch that produced that definition.
+    let launch = sandbox.run(&["add", "web", "--restart", "--", "sleep", "300"]);
+
+    assert_eq!(code(&launch), 0);
+    assert_eq!(
+        sandbox
+            .calls_containing(
+                "systemd-run --user --unit=bgrun-web.service --collect -p Restart=on-failure"
+            )
+            .len(),
+        1,
+        "calls: {:?}",
+        sandbox.calls()
+    );
+
+    assert_eq!(code(&sandbox.run(&["stop", "web"])), 0);
+    let saved = fs::read_to_string(sandbox.unit_file("bgrun-web.service"))
+        .expect("the definition was saved before the stop");
+    assert!(saved.contains("Restart=on-failure\n"), "{saved}");
+
+    assert_eq!(code(&sandbox.run(&["resume", "web"])), 0);
+    assert_eq!(
+        sandbox
+            .calls_containing("systemctl --user start bgrun-web.service")
+            .len(),
+        1
+    );
+    // Nothing re-derived the definition on the way back in.
+    assert_eq!(
+        fs::read_to_string(sandbox.unit_file("bgrun-web.service")).unwrap(),
+        body
+    );
+}
+
+#[test]
+fn remove_takes_a_paused_jobs_saved_definition_with_it() {
+    let sandbox = Sandbox::new();
+    sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+    assert_eq!(code(&sandbox.run(&["stop", "dl"])), 0);
+    assert!(sandbox.unit_file("bgrun-dl.service").exists());
+
+    let output = sandbox.run(&["remove", "dl"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(
+        stdout(&output).contains("removed: bgrun-dl.service"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        !sandbox.unit_file("bgrun-dl.service").exists(),
+        "a saved definition must not outlive the job it belongs to"
+    );
+    assert_eq!(
+        sandbox
+            .calls_containing("systemctl --user disable bgrun-dl.service")
+            .len(),
+        1
+    );
+    assert_eq!(
+        sandbox
+            .calls_containing("systemctl --user daemon-reload")
+            .len(),
+        1
+    );
+}
+
+/// systemd explains at length, on stderr, that a unit with no `[Install]`
+/// cannot be disabled — and exits 0 anyway. A `remove` that worked has nothing
+/// to add to that, while a `disable` that genuinely failed must still be heard.
+#[test]
+fn remove_keeps_quiet_about_a_disable_systemd_explains_away() {
+    let sandbox = Sandbox::new();
+    sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+    assert_eq!(code(&sandbox.run(&["stop", "dl"])), 0);
+    // A disable that explains itself on stderr and exits 0, as systemd does.
     sandbox.shim(
         "systemctl",
-        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\ncase \"$*\" in *bgrun-a.service) echo 'Failed to stop' >&2; exit 1;; esac\n",
+        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+         case \" $* \" in\n\
+         *' disable '*) echo 'The unit files have no installation config' >&2; exit 0;;\n\
+         esac\n",
     );
+
+    let output = sandbox.run(&["remove", "dl"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(!sandbox.unit_file("bgrun-dl.service").exists());
+    assert!(
+        !stderr(&output).contains("no installation config"),
+        "a disable that succeeded must not lecture: stderr: {}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("removed: bgrun-dl.service"));
+
+    // The other half: a disable that really failed is still the user's to see.
+    sandbox.write_unit_file("bgrun-dl.service");
+    sandbox.fail_verb("systemctl", "disable", "Failed to disable unit");
+    let output = sandbox.run(&["remove", "dl"]);
+
+    assert_eq!(code(&output), 0);
+    assert!(
+        stderr(&output).contains("Failed to disable unit"),
+        "a real failure must not be swallowed: stderr: {}",
+        stderr(&output)
+    );
+
+    // And one that cannot run at all. `remove` discards the results of the two
+    // systemctl calls before this one, so if the disable is quiet about not
+    // being able to start, it says nothing. The unit file is a directory here,
+    // so the delete after it fails and the `daemon-reload` is never reached:
+    // whatever this says about systemctl can only have come from the disable.
+    fs::create_dir_all(sandbox.unit_file("bgrun-dl.service")).unwrap();
+    fs::remove_file(sandbox.root.join("bin").join("systemctl")).unwrap();
+    let output = sandbox.run(&["remove", "dl"]);
+
+    assert_eq!(code(&output), 0);
+    let err = stderr(&output);
+    assert!(
+        err.contains("cannot run systemctl"),
+        "a disable that could not run at all must be reported: stderr: {err}"
+    );
+    assert!(
+        !err.contains("daemon-reload"),
+        "this case must not reach the reload: stderr: {err}"
+    );
+}
+
+#[test]
+fn a_stop_systemd_refuses_is_reported_as_a_failure() {
+    let sandbox = Sandbox::new();
+    // `a` is transient, so its definition is saved before the stop — and the
+    // stop is refused. One named unit fails; the loop must still reach the
+    // next name. The refusal is for the verb only: a shim that failed the
+    // `show` too would never reach a copy at all, and this test is named for
+    // the stop.
+    sandbox.transient_unit("bgrun-a.service", TRANSIENT_UNIT);
+    sandbox.stop_refused_for("bgrun-a.service", "Failed to stop");
 
     let output = sandbox.run(&["stop", "a", "b"]);
 
@@ -715,6 +1101,45 @@ fn a_stop_systemd_refuses_is_reported_as_a_failure() {
     assert!(
         stdout(&output).contains("stopped: bgrun-b.service"),
         "one bad name must not skip the rest"
+    );
+}
+
+/// A definition the stop failed to act on would make `resume` start a job that
+/// is still running — or that had already finished, which is the resurrection
+/// the ticket exists to prevent. The save is a marker, and a stop that did not
+/// happen must not leave one behind.
+#[test]
+fn a_stop_that_failed_takes_the_saved_definition_back_away() {
+    let sandbox = Sandbox::new();
+    sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+    sandbox.stop_refused_for("bgrun-dl.service", "Failed to stop");
+
+    let output = sandbox.run(&["stop", "dl"]);
+
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    // The copy really did happen first, or this test would pass for free: a
+    // `show` that never ran, or ran after the stop, would leave no definition
+    // to take back.
+    let calls = sandbox.calls();
+    let at = |needle: &str| {
+        calls
+            .iter()
+            .position(|call| call.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in {calls:?}"))
+    };
+    assert!(
+        at("FragmentPath") < at("stop bgrun-dl.service"),
+        "the save comes before the stop it may have to undo: {calls:?}"
+    );
+    assert!(
+        !sandbox.unit_file("bgrun-dl.service").exists(),
+        "a refused stop must leave no definition to resume from: {:?}",
+        sandbox.calls()
+    );
+    assert!(
+        !stdout(&output).contains("resume with"),
+        "nothing was paused, so nothing may claim to be: {}",
+        stdout(&output)
     );
 }
 
@@ -728,7 +1153,7 @@ fn a_stop_of_a_collected_unit_says_to_re_add_it() {
     assert_eq!(code(&output), 1);
     let err = stderr(&output);
     assert!(
-        err.contains("only a --persist job survives a stop"),
+        err.contains("bgrun stop makes a job resumable"),
         "the re-add rule is missing:\n{err}"
     );
     assert!(
@@ -747,12 +1172,65 @@ fn a_resume_of_a_collected_unit_says_to_re_add_it() {
     assert_eq!(code(&output), 1);
     let err = stderr(&output);
     assert!(
-        err.contains("only a --persist job survives a stop"),
+        err.contains("bgrun stop makes a job resumable"),
         "the re-add rule is missing:\n{err}"
     );
     assert!(
         err.contains("bgrun add dl -- <cmd>"),
         "the hint must name the re-add:\n{err}"
+    );
+}
+
+/// The ceiling: a job that ended some other way — it finished, or a failed
+/// dependency or a hand-run `systemctl --user stop` took it — is gone, and its
+/// definition with it. `resume` must say so and start nothing.
+///
+/// The definition is still there in the runtime directory, which is what makes
+/// this falsifiable: the unit is gone, but a copy of it is available to anyone
+/// who writes one. `resume` writing that copy is the resurrection the ticket
+/// exists to prevent, and this is where it would show up.
+#[test]
+fn a_resume_of_a_collected_job_starts_nothing_even_with_a_definition_to_copy() {
+    let sandbox = Sandbox::new();
+    // systemd still holds the definition, and reports the unit as transient,
+    // but the unit itself is gone — the state a finished or hand-stopped job
+    // leaves behind.
+    sandbox.transient_unit("bgrun-dl.service", TRANSIENT_UNIT);
+    let definition = sandbox.runtime_dir().join("bgrun-dl.service");
+    let shim = format!(
+        "printf '%s\\n' \"$0 $*\" >> \"$BGRUN_TEST_LOG\"\n\
+         case \"$*\" in\n\
+         *LoadState*) echo not-found; exit 0;;\n\
+         *FragmentPath*) echo {definition}; exit 0;;\n\
+         esac\n\
+         echo 'Failed: Unit not loaded.' >&2\nexit 5\n",
+        definition = definition.display()
+    );
+    sandbox.shim("systemctl", &shim);
+
+    let output = sandbox.run(&["resume", "dl"]);
+
+    assert_eq!(code(&output), 1, "stderr: {}", stderr(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("bgrun add dl -- <cmd>"),
+        "the hint must name the re-add:\n{err}"
+    );
+    // `resume` starts and does not save. Asking where the definition is would
+    // be a copy in progress, and the collected unit answers with a path whose
+    // every byte is a finished job — the one thing the saved file may not
+    // become. The end state alone cannot catch this, because a copy made
+    // before a failed `start` is rolled back; the call can.
+    assert!(
+        sandbox.calls_containing("FragmentPath").is_empty(),
+        "resume must not go looking for a definition to save: {:?}",
+        sandbox.calls()
+    );
+    assert!(
+        !sandbox.unit_file("bgrun-dl.service").exists(),
+        "a job nobody stopped has no definition to resume, so resume must \
+         leave none: {:?}",
+        sandbox.calls()
     );
 }
 
@@ -1514,8 +1992,10 @@ fn help_flag_exits_successfully() {
         "clean",
         "--restart",
         "--persist",
-        // The help must not imply a transient job can be resumed (#4).
-        "--persist only resumes",
+        // The help must describe the pause, not the --persist-only limitation
+        // the design on #5 replaced.
+        "stop for now; resume starts it again",
+        "does not survive a reboot",
     ] {
         assert!(out.contains(expected), "help omits {expected}:\n{out}");
     }

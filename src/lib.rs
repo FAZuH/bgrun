@@ -180,13 +180,13 @@ pub enum Action {
         name: JobName,
         journalctl_opts: Vec<OsString>,
     },
-    /// Stop units for now; `resume` starts them again. Only a persisted job
-    /// survives a stop — a transient one is collected as it goes inactive.
+    /// Stop units for now; `resume` starts them again. A transient unit's
+    /// definition is saved first, so the pause is a pause and not a loss.
     Stop(Vec<JobName>),
     /// Start stopped units again.
     Resume(Vec<JobName>),
-    /// Stop and forget units for good: a persisted job's unit file is
-    /// deleted, so it does not come back at the next boot.
+    /// Stop and forget units for good: a unit file is deleted, whether
+    /// `--persist` wrote it or `stop` saved it, so nothing comes back.
     Remove(Vec<JobName>),
     Clean,
 }

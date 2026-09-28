@@ -4,10 +4,12 @@
 //! one subprocess call shape here. End-to-end tests (`tests/end_to_end.rs`)
 //! run this binary against PATH shims for systemctl/systemd-run/journalctl.
 
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
@@ -524,33 +526,66 @@ fn journal_has_records(unit: &str) -> Option<bool> {
     output.status.success().then_some(!output.stdout.is_empty())
 }
 
-/// Stop units for now, leaving a persisted job's unit file alone so
-/// `resume` — or the next boot — brings it back. A transient job is
-/// collected the moment it goes inactive, so for one of those a stop is
-/// final and only `remove` is left to say.
+/// Stop units for now. A persisted job's unit file stays where it is, so
+/// `resume` — or the next boot — brings it back. A transient one is collected
+/// the moment it goes inactive, which would make the stop final, so its own
+/// definition is saved first and the job can be paused instead of lost.
 fn stop(prefix: &Prefix, names: &[JobName]) -> ExitCode {
-    for_each_unit(prefix, names, "stop", "stopped")
+    for_each_unit(prefix, names, "stop", "stopped", true)
 }
 
 /// `systemctl start` for whatever `stop` left behind.
 fn resume(prefix: &Prefix, names: &[JobName]) -> ExitCode {
-    for_each_unit(prefix, names, "start", "resumed")
+    for_each_unit(prefix, names, "start", "resumed", false)
 }
 
 /// `systemctl --user <verb> <unit>` per name, one line of output per name
-/// that worked. A unit systemd no longer knows gets the re-add instruction,
-/// since only a persisted job survives a stop.
-fn for_each_unit(prefix: &Prefix, names: &[JobName], verb: &str, done: &str) -> ExitCode {
+/// that worked. With `preserve`, a transient unit's definition is copied out
+/// before the verb runs, and the verb is refused when that fails.
+///
+/// A unit systemd no longer knows gets the re-add instruction: a job `bgrun
+/// stop` paused is resumable, one that finished or was stopped by something
+/// else is not, and `bgrun add` is the only way back.
+fn for_each_unit(
+    prefix: &Prefix,
+    names: &[JobName],
+    verb: &str,
+    done: &str,
+    preserve: bool,
+) -> ExitCode {
     let mut all_ok = true;
     for name in names {
         let unit = prefix.unit(name);
+        let preserved = if preserve {
+            match preserve_definition(&unit) {
+                Ok(preserved) => preserved,
+                Err(reason) => {
+                    eprintln!("error: {reason}");
+                    all_ok = false;
+                    continue;
+                }
+            }
+        } else {
+            false
+        };
         let (_, ok) = systemctl_user(&[verb, &unit]);
+        if !ok && preserved {
+            // A definition the stop failed to act on would make a job that is
+            // still running — or that had already finished — resumable, which
+            // is what the save exists to prevent. Put it back the way it was.
+            rollback_definition(&unit);
+        }
         if ok {
-            println!("{done}: {unit}");
+            let pause = if preserved {
+                format!(" (resume with: bgrun resume {name})")
+            } else {
+                String::new()
+            };
+            println!("{done}: {unit}{pause}");
         } else if unit_missing(&unit) {
             eprintln!("error: {unit} is not a unit systemd knows");
-            eprintln!("  only a --persist job survives a stop; a transient one is");
-            eprintln!("  collected as soon as it stops or finishes.");
+            eprintln!("  bgrun stop makes a job resumable, this one was not: it either");
+            eprintln!("  finished on its own, or something else stopped it.");
             eprintln!("  re-add it:  bgrun add {name} -- <cmd>");
         }
         all_ok &= ok;
@@ -649,9 +684,104 @@ fn transient_shadow(unit: &str) -> bool {
         .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "transient")
 }
 
+/// Save a transient unit's own definition into the user unit directory, so a
+/// stop leaves something `resume` can start. `Ok(true)` when a definition was
+/// copied, `Ok(false)` when there is none to copy — a persisted job's
+/// definition is already in that directory, and a unit with no definition at
+/// all is not one of ours.
+///
+/// The error is a refusal, and the caller must honour it: the definition is
+/// collected along with the unit, so stopping the job anyway would leave
+/// nothing to resume it from.
+fn preserve_definition(unit: &str) -> Result<bool, String> {
+    let Some(source) = transient_fragment(unit) else {
+        return Ok(false);
+    };
+    let Some(dir) = user_unit_dir() else {
+        return Err(ParseError::NoUnitDirectory.to_string());
+    };
+    let target = dir.join(unit);
+    if let Err(error) = save(&source, &target) {
+        return Err(format!(
+            "cannot save {unit} for resume: {}: {error}\n  \
+             refusing to stop: a transient definition is gone the moment its unit stops",
+            target.display()
+        ));
+    }
+    // systemd's own bytes, verbatim: no `[Install]` (a pause must not survive a
+    // reboot — that is `--persist`, and the user's call), and no
+    // `CollectMode` stripped (the resumed unit collects the same way the
+    // transient one did).
+    Ok(true)
+}
+
+/// Copy `source` onto `target` whole or not at all.
+///
+/// `fs::copy` opens the destination `O_TRUNC` and then writes, so a failure
+/// part way through — a full disk, a file-size limit — leaves a short file that
+/// `resume` would happily start, and a refusal that claims nothing was saved
+/// next to the wreckage. Writing a staging file in the same directory and
+/// renaming it over the target makes the copy atomic: the target appears only
+/// once every byte is there, which is also why a stale staging file cannot be
+/// mistaken for one.
+fn save(source: &Path, target: &Path) -> io::Result<()> {
+    let staging = target.with_extension("bgrun-saving");
+    let written = fs::create_dir_all(target.parent().expect("a unit file has a parent"))
+        .and_then(|()| fs::copy(source, &staging));
+    if let Err(error) = written.and_then(|_| fs::rename(&staging, target)) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Undo a [`preserve_definition`] whose stop then failed. A saved definition
+/// is the "the user stopped this" marker `resume` trusts, and the stop is what
+/// makes that true: without it the unit may well have finished on its own,
+/// which must never be resurrected. The copy is bgrun's own bookkeeping, so it
+/// goes away again; a unit file the user wrote is not touched, because only a
+/// transient unit ever had a definition copied over it.
+fn rollback_definition(unit: &str) {
+    let Some(dir) = user_unit_dir() else {
+        return;
+    };
+    if let Err(error) = fs::remove_file(dir.join(unit))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("warning: cannot take back the definition saved for {unit}: {error}");
+    }
+}
+
+/// Where systemd keeps a transient unit's own definition while the unit is
+/// loaded: `…/systemd/transient/<unit>`, argv included. Asked of systemd
+/// rather than assembled from `$XDG_RUNTIME_DIR`, so a non-default runtime dir
+/// resolves — and so a persisted job, whose `FragmentPath` is the file bgrun
+/// wrote, comes back `None` and is left alone.
+fn transient_fragment(unit: &str) -> Option<PathBuf> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=FragmentPath", "--value"])
+        .output()
+        .ok()?;
+    // A unit the manager has never heard of, or one already collected, answers
+    // with nothing at all, and an empty path has no components — so both are
+    // settled by the same check, and a persisted job is settled by it too.
+    // Compared as path components rather than as a substring, so only systemd's
+    // own runtime directory counts.
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let components: Vec<_> = path.components().collect();
+    components
+        .windows(2)
+        .any(|pair| {
+            pair[0].as_os_str() == OsStr::new("systemd")
+                && pair[1].as_os_str() == OsStr::new("transient")
+        })
+        .then_some(path)
+}
+
 /// Disable and delete a persisted job's unit file, so it does not come back
-/// at the next boot. A transient job has no file on disk, so this does
-/// nothing at all for it and `remove` stays as quiet as it was.
+/// at the next boot, and a transient job's definition saved by `stop`, so
+/// that too leaves nothing behind. A transient job that was never stopped
+/// has no file on disk, so this does nothing at all for it.
 fn forget(prefix: &Prefix, name: &JobName) {
     let Some(dir) = user_unit_dir() else {
         return;
@@ -661,12 +791,35 @@ fn forget(prefix: &Prefix, name: &JobName) {
     if !path.exists() {
         return;
     }
-    let _ = systemctl_user(&["disable", &unit]);
+    disable(&unit);
     match fs::remove_file(&path) {
         Ok(()) => {
             let _ = systemctl_user(&["daemon-reload"]);
         }
         Err(error) => eprintln!("warning: cannot delete {}: {error}", path.display()),
+    }
+}
+
+/// `systemctl --user disable`, discarding a success and a notice alike.
+///
+/// A definition `stop` saved has no `[Install]`, and systemd answers a disable
+/// for one with a paragraph of `log_notice` on stderr while still exiting 0 —
+/// noise on a `remove` that worked. The exit status is what separates the two:
+/// a real failure is a `log_error` and a non-zero exit. A disable that cannot
+/// run at all is reported, because `remove` discards the results of the two
+/// calls before this one and would otherwise say nothing at all.
+fn disable(unit: &str) {
+    match Command::new("systemctl")
+        .args(["--user", "disable", unit])
+        .output()
+    {
+        Ok(output) if !output.status.success() => {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = spawn_failed("systemctl", &error);
+        }
     }
 }
 
@@ -703,8 +856,8 @@ Usage:
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
   bgrun watch <name> [journalctl opts]      stream the job, then exit with its status
-  bgrun stop <name> [name...]                stop for now (--persist only resumes)
-  bgrun resume <name> [name...]              start a stopped --persist job again
+  bgrun stop <name> [name...]                stop for now; resume starts it again
+  bgrun resume <name> [name...]              start a job bgrun stop paused
   bgrun remove <name> [name...]              stop + forget, for good
   bgrun clean                                forget failed {prefix}-* units
 
@@ -723,6 +876,13 @@ Flags (either form, in front of the overrides):
                    (systemd's own limit still applies: 5 starts per 10s)
   -b, --persist    write a unit file and enable it, so the job also runs at
                    every boot. Only -p KEY=VALUE overrides can be persisted.
+
+'stop' is a pause, not a removal. A job without --persist has its unit
+definition saved under ~/.config/systemd/user before it stops, so 'resume'
+starts the same command, working directory and properties again. The pause
+does not survive a reboot — that is -b/--persist, and it is your call. A job
+that ended any other way, because it finished or something else stopped it,
+cannot be resumed: add it again.
 "
     )
 }
