@@ -183,7 +183,8 @@ fn resume(prefix: &Prefix, names: &[JobName]) -> ExitCode {
 }
 
 /// `systemctl --user <verb> <unit>` per name, one line of output per name
-/// that worked.
+/// that worked. A unit systemd no longer knows gets the re-add instruction,
+/// since only a persisted job survives a stop.
 fn for_each_unit(prefix: &Prefix, names: &[JobName], verb: &str, done: &str) -> ExitCode {
     let mut all_ok = true;
     for name in names {
@@ -191,6 +192,11 @@ fn for_each_unit(prefix: &Prefix, names: &[JobName], verb: &str, done: &str) -> 
         let (_, ok) = systemctl_user(&[verb, &unit]);
         if ok {
             println!("{done}: {unit}");
+        } else if unit_missing(&unit) {
+            eprintln!("error: {unit} is not a unit systemd knows");
+            eprintln!("  only a --persist job survives a stop; a transient one is");
+            eprintln!("  collected as soon as it stops or finishes.");
+            eprintln!("  re-add it:  bgrun add {name} -- <cmd>");
         }
         all_ok &= ok;
     }
@@ -260,6 +266,15 @@ fn user_unit_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("systemd").join("user"))
+}
+
+/// Whether systemd still has a unit under this name at all. Distinct from
+/// [`transient_shadow`], which asks about a unit that *is* loaded.
+fn unit_missing(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=LoadState", "--value"])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "not-found")
 }
 
 /// Whether a transient unit of this name is currently loaded. Persisting
@@ -332,8 +347,8 @@ Usage:
   bgrun list
   bgrun status <name>
   bgrun logs <name> [journalctl opts]
-  bgrun stop <name> [name...]                stop for now
-  bgrun resume <name> [name...]              start a stopped job again
+  bgrun stop <name> [name...]                stop for now (--persist only resumes)
+  bgrun resume <name> [name...]              start a stopped --persist job again
   bgrun remove <name> [name...]              stop + forget, for good
   bgrun clean                                forget failed {prefix}-* units
 
