@@ -79,17 +79,27 @@ Run `bgrun help` for the full command list.
   `loginctl enable-linger $USER`. `bgrun add` warns when it is off.
 - Successful jobs disappear on their own (transient `--collect` units);
   `bgrun clean` only clears units that exited non-zero.
-- `bgrun stop` is temporary and `bgrun resume` undoes it, but only for a
-  job added with `--persist`: a transient unit is collected the moment it
-  stops, so stopping one is final. `bgrun remove` is the only way to be sure.
+- `bgrun stop` is temporary and `bgrun resume` undoes it, for any job. A job
+  without `--persist` is paused by saving its own unit definition into
+  `~/.config/systemd/user` *before* it stops, so `resume` starts the same
+  command, working directory and properties again — `--restart` included. If
+  that definition cannot be saved, the stop is refused and the job keeps
+  running rather than becoming unresumable — and a stop that then fails takes
+  the saved definition back with it, so a job that is still running is never
+  left resumable. Two limits: a pause does not
+  survive a reboot (that is `--persist`), and it cannot help a job that ended
+  some other way — one that finished, or that a failed dependency or a
+  hand-run `systemctl --user stop` halted — because its definition is already
+  gone. Those need `bgrun add` again.
 - `--restart` is `Restart=on-failure`, so systemd's own start limit still
   applies: 5 starts per 10s, after which the job gives up and is collected.
 - `--persist` is the one thing that is not transient — a transient unit
   cannot be enabled, so bgrun writes a unit file under the systemd user unit
   directory (`~/.config/systemd/user`) and enables it. Only `-p KEY=VALUE`
   overrides can be written to a unit file. The job then starts at every boot,
-  which is exactly why `bgrun remove` is what deletes that file again. A name
-  already taken by a running transient job is refused: stop it first. The
+  which is exactly why `bgrun remove` is what deletes that file again — and the
+  definition a paused job saved, so a job leaves nothing behind either way. A
+  name already taken by a running transient job is refused: stop it first. The
   command is resolved to an absolute path exactly as `systemd-run` does,
   because a unit file only searches systemd's own list for a bare name — a
   command that is in nobody's `PATH` is refused instead of failing at boot.

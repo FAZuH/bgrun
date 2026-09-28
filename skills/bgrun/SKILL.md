@@ -105,10 +105,26 @@ every boot. Four consequences worth respecting:
 ## Pausing instead of removing
 
 `bgrun stop <name>` is the temporary one and `bgrun resume <name>` starts it
-again — but only for a job added with `-b`. A transient job is collected the
-moment it stops, so `bgrun resume` answers "Unit not found" and only
-`bgrun remove` was ever going to be a clean way to end it. Never promise the
-user a `stop`/`resume` cycle for a job launched without `-b`.
+again, for any job. `stop` saves the job's unit definition under
+`~/.config/systemd/user` before stopping it, so the resumed job is the same
+command, working directory and properties — `--restart` included.
+
+Three limits worth stating up front rather than discovering mid-task:
+
+- A pause does not survive a reboot. That is what `-b/--persist` is for, and
+  it is the user's decision to make, not a side effect of pausing.
+- A job that ended any other way — it finished, a dependency failed, or
+  `systemctl --user stop` ran by hand — cannot be resumed; its definition is
+  already gone. `bgrun add <name> -- <cmd>` starts a fresh one. Never promise
+  a resume for a job you did not stop with `bgrun stop`.
+- If the definition cannot be saved, `bgrun stop` is refused and the job keeps
+  running. Report that rather than retrying or working around it. If the stop
+  itself then fails, the saved definition is taken back again — nothing is left
+  to resume, so the job is exactly as it was.
+
+After a stop, the name holds that saved definition, so `bgrun add <name>`
+fails until `bgrun remove <name>` deletes it — the same duplicate-name error,
+the same remedy.
 
 ## After launching
 
